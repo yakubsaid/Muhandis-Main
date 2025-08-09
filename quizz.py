@@ -19,7 +19,7 @@ logging.basicConfig(level=logging.INFO)
 
 # Bot configuration
 BOT_TOKEN = "8067408775:AAG9JhYg4F65heKU7CxIbFS-09F5l5cMvkk"  # Replace with your bot token
-OWNER_ID = 7377694590  # Replace with owner's Telegram ID
+OWNER_ID = 5479445322  # Replace with owner's Telegram ID
 
 # Initialize bot and dispatcher
 bot = Bot(token=BOT_TOKEN)
@@ -876,3 +876,4 @@ async def main():
 
 if __name__ == '__main__':
     asyncio.run(main())
+
