@@ -17,9 +17,20 @@ import calendar
 logging.basicConfig(level=logging.INFO)
 
 # Bot configuration
-BOT_TOKEN = "8067408775:AAE5wp5C0gq4W1IMC59is37lE43IRScHxk4"  # Replace with your bot token
-OWNER_IDS = [5479445322, 7377694590]
- # Replace with owner's Telegram ID
+BOT_TOKEN = "8067408775:AAH7dq5lq-tJbKq6ElQL9JI-RJ67_mbZENM"  # Replace with your bot token
+
+# Admin configuration - Add your admin IDs here
+ADMIN_IDS = {
+    5479445322,  # Main owner
+    # Add more admin IDs here, separated by commas:
+    7377694590,   # Admin 2
+    # 987654321,   # Admin 3
+    # 555666777,   # Admin 4
+}
+
+# Helper function to check if user is admin
+def is_admin(user_id):
+    return user_id in ADMIN_IDS
 
 # Initialize bot and dispatcher
 bot = Bot(token=BOT_TOKEN)
@@ -355,7 +366,12 @@ class QuizTimer:
             if user_position:
                 owner_text += f"\n🏆 Ikki haftalik reytingda: {user_position}-o'rin"
             
-            await bot.send_message(OWNER_ID, owner_text)
+            # Send to all admins
+            for admin_id in ADMIN_IDS:
+                try:
+                    await bot.send_message(admin_id, owner_text)
+                except Exception as e:
+                    logging.error(f"Failed to send message to admin {admin_id}: {e}")
             
             # Clean up
             await QuizTimer.cancel_timer(user_id)
@@ -447,10 +463,10 @@ def get_ranking_keyboard():
 # Start command
 @dp.message(Command("start"))
 async def start_command(message: types.Message):
-    if message.from_user.id == OWNER_ID:
+    if is_admin(message.from_user.id):
         await message.answer(
             "🎮 Test Botga Xush kelibsiz!\n\n"
-            "Siz egasiz. Qanday ish qilmoqchisiz:",
+            "Siz adminsiz. Qanday ish qilmoqchisiz:",
             reply_markup=get_owner_keyboard()
         )
     else:
@@ -466,8 +482,8 @@ async def start_command(message: types.Message):
 # Quiz command for users
 @dp.message(Command("quiz"))
 async def quiz_command(message: types.Message, state: FSMContext):
-    if message.from_user.id == OWNER_ID:
-        await message.answer("❌ Egalar test ololmaydi. Testlarni boshqarish uchun menyudan foydalaning.")
+    if is_admin(message.from_user.id):
+        await message.answer("❌ Adminlar test ololmaydi. Testlarni boshqarish uchun menyudan foydalaning.")
         return
     
     # Cancel any existing timer
@@ -495,7 +511,7 @@ async def quiz_command(message: types.Message, state: FSMContext):
     await state.set_state(QuizTaking.waiting_for_name)
 
 # Handle owner callbacks
-@dp.callback_query(lambda c: c.from_user.id == OWNER_ID)
+@dp.callback_query(lambda c: is_admin(c.from_user.id))
 async def handle_owner_callbacks(callback: CallbackQuery, state: FSMContext):
     if callback.data == "create_quiz":
         await callback.message.edit_text(
@@ -658,7 +674,7 @@ async def handle_owner_callbacks(callback: CallbackQuery, state: FSMContext):
     elif callback.data == "back_to_menu":
         await callback.message.edit_text(
             "🎮 Test Botga xush kelibsiz!\n\n"
-            "Siz egasiz. Qanday ish qilmoqchisiz:",
+            "Siz adminsiz. Qanday ish qilmoqchisiz:",
             reply_markup=get_owner_keyboard()
         )
     
@@ -700,7 +716,7 @@ async def handle_owner_callbacks(callback: CallbackQuery, state: FSMContext):
 # Handle quiz creation states
 @dp.message(QuizCreation.waiting_for_quiz_name)
 async def process_quiz_name(message: types.Message, state: FSMContext):
-    if message.from_user.id != OWNER_ID:
+    if not is_admin(message.from_user.id):
         return
     
     await state.update_data(quiz_name=message.text)
@@ -712,7 +728,7 @@ async def process_quiz_name(message: types.Message, state: FSMContext):
 
 @dp.message(QuizCreation.waiting_for_question_count)
 async def process_question_count(message: types.Message, state: FSMContext):
-    if message.from_user.id != OWNER_ID:
+    if not is_admin(message.from_user.id):
         return
     
     try:
@@ -737,7 +753,7 @@ async def process_question_count(message: types.Message, state: FSMContext):
 
 @dp.message(QuizCreation.waiting_for_question)
 async def process_question(message: types.Message, state: FSMContext):
-    if message.from_user.id != OWNER_ID:
+    if not is_admin(message.from_user.id):
         return
     
     data = await state.get_data()
@@ -752,7 +768,7 @@ async def process_question(message: types.Message, state: FSMContext):
 
 @dp.message(QuizCreation.waiting_for_variants)
 async def process_variants(message: types.Message, state: FSMContext):
-    if message.from_user.id != OWNER_ID:
+    if not is_admin(message.from_user.id):
         return
     
     data = await state.get_data()
@@ -774,7 +790,7 @@ async def process_variants(message: types.Message, state: FSMContext):
 
 @dp.message(QuizCreation.waiting_for_correct_answer)
 async def process_correct_answer(message: types.Message, state: FSMContext):
-    if message.from_user.id != OWNER_ID:
+    if not is_admin(message.from_user.id):
         return
     
     try:
@@ -835,7 +851,7 @@ async def process_correct_answer(message: types.Message, state: FSMContext):
 # Handle quiz taking states
 @dp.message(QuizTaking.waiting_for_name)
 async def process_user_name(message: types.Message, state: FSMContext):
-    if message.from_user.id == OWNER_ID:
+    if is_admin(message.from_user.id):
         return
     
     name = message.text.strip()
@@ -880,8 +896,8 @@ async def process_user_name(message: types.Message, state: FSMContext):
 # Handle quiz answers
 @dp.callback_query(lambda c: c.data.startswith("answer_"))
 async def handle_quiz_answers(callback: CallbackQuery, state: FSMContext):
-    if callback.from_user.id == OWNER_ID:
-        await callback.answer("❌ Ega test yecha olmaydi.")
+    if is_admin(callback.from_user.id):
+        await callback.answer("❌ Admin test yecha olmaydi.")
         return
     
     # Cancel the timer since user answered
@@ -999,7 +1015,13 @@ async def handle_quiz_answers(callback: CallbackQuery, state: FSMContext):
         if user_position:
             owner_text += f"\n🏆 Ikki haftalik reytingda: {user_position}-o'rin"
         
-        await bot.send_message(OWNER_ID, owner_text)
+        # Send to all admins
+        for admin_id in ADMIN_IDS:
+            try:
+                await bot.send_message(admin_id, owner_text)
+            except Exception as e:
+                logging.error(f"Failed to send message to admin {admin_id}: {e}")
+        
         await state.clear()
     
     await callback.answer()
@@ -1016,7 +1038,7 @@ async def ranking_command(message: types.Message):
         ranking_text += f"📅 {start_date.strftime('%d.%m.%Y')} - {end_date.strftime('%d.%m.%Y')}\n\n"
         
         # Show different amount based on user type
-        show_count = 20 if message.from_user.id == OWNER_ID else 10
+        show_count = 20 if is_admin(message.from_user.id) else 10
         
         for i, user in enumerate(current_ranking[:show_count], 1):
             medal = "🥇" if i == 1 else "🥈" if i == 2 else "🥉" if i == 3 else f"{i}."
@@ -1030,7 +1052,7 @@ async def ranking_command(message: types.Message):
             ranking_text += "\n"
         
         # If user is not in top 10, show their position
-        if message.from_user.id != OWNER_ID:
+        if not is_admin(message.from_user.id):
             user_position = None
             user_data = None
             for i, user in enumerate(current_ranking, 1):
@@ -1056,7 +1078,7 @@ async def handle_other_messages(message: types.Message, state: FSMContext):
     current_state = await state.get_state()
     
     # If user is taking quiz and sends a message, cancel timer
-    if current_state == QuizTaking.taking_quiz.state and message.from_user.id != OWNER_ID:
+    if current_state == QuizTaking.taking_quiz.state and not is_admin(message.from_user.id):
         await QuizTimer.cancel_timer(message.from_user.id)
         await message.answer(
             "❌ Test bekor qilindi!\n\n"
@@ -1072,5 +1094,3 @@ async def main():
 
 if __name__ == '__main__':
     asyncio.run(main())
-
-
