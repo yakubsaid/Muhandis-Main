@@ -24,8 +24,8 @@ ADMIN_IDS = {
     5479445322,  # Main owner
     # Add more admin IDs here, separated by commas:
     7377694590,   # Admin 2
-    # 987654321,   # Admin 3
-    # 555666777,   # Admin 4
+    5700652572,   # Admin 3
+    6874971657,   # Admin 4
 }
 
 # Helper function to check if user is admin
@@ -1094,5 +1094,6 @@ async def main():
 
 if __name__ == '__main__':
     asyncio.run(main())
+
 
 
