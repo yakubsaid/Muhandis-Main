@@ -22,7 +22,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Bot Token - Replace with your actual bot token
-BOT_TOKEN = "8307914914:AAERqHltJziNi-IcIu8BwAFlKvf8KYVTbrI"
+BOT_TOKEN = "7650813049:AAEuljgRluENrLkjz939Sg_eNyqrWkgK8Ck"
 
 # Admin User IDs - Add your admin IDs here
 ADMIN_IDS = [5479445322, 7377694590]  # Replace with actual admin IDs
@@ -341,9 +341,23 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
     else:
         if quiz_bot.is_admin(user.id):
+            # For admins, show admin panel instead of error message
+            keyboard = [
+                [InlineKeyboardButton("📝 Test Yaratish", callback_data="create_test")],
+                [InlineKeyboardButton("👥 Foydalanuvchilar", callback_data="users"),
+                 InlineKeyboardButton("📊 Natijalar", callback_data="results")],
+                [InlineKeyboardButton("🏆 Haftalik Reyting", callback_data="weekly_ranking"),
+                 InlineKeyboardButton("📋 Mening Testlarim", callback_data="my_tests")]
+            ]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            
             await update.message.reply_text(
-                "❌ Noto'g'ri buyruq. Admin panelidan foydalaning.\n"
-                "Qaytadan boshlash uchun /start bosing."
+                f"🎯 <b>Admin paneli</b>\n\n"
+                f"Siz kiritgan matn: <code>{text}</code>\n\n"
+                f"💡 Agar test kodini tekshirmoqchi bo'lsangiz, 6 ta harf/raqamdan iborat kod kiriting.\n"
+                f"Admin funksiyalardan foydalanish uchun quyidagi tugmalarni bosing:",
+                reply_markup=reply_markup,
+                parse_mode='HTML'
             )
         else:
             await update.message.reply_text(
