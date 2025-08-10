@@ -1,1099 +1,774 @@
-# main.py
-import asyncio
 import logging
-from aiogram import Bot, Dispatcher, types
-from aiogram.filters import Command
-from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
-from aiogram.fsm.context import FSMContext
-from aiogram.fsm.state import State, StatesGroup
-from aiogram.fsm.storage.memory import MemoryStorage
+import asyncio
 import json
 import random
 import string
 from datetime import datetime, timedelta
-import calendar
+from typing import Dict, List, Optional
+from dataclasses import dataclass, asdict
+from pathlib import Path
+
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import (
+    Application, CommandHandler, MessageHandler, CallbackQueryHandler,
+    ConversationHandler, ContextTypes, filters
+)
 
 # Configure logging
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
+)
+logger = logging.getLogger(__name__)
 
-# Bot configuration
-BOT_TOKEN = "8307914914:AAFCPYAsRkH850OYlyd-Kb1T_MbaNoOXEHQ"  # Replace with your bot token
+# Bot Token - Replace with your actual bot token
+BOT_TOKEN = "8307914914:AAERqHltJziNi-IcIu8BwAFlKvf8KYVTbrI"
 
-# Admin configuration - Add your admin IDs here
-ADMIN_IDS = {
-    5479445322,  # Main owner
-    # Add more admin IDs here, separated by commas:
-    7377694590,   # Admin 2
-    5700652572,   # Admin 3
-    6874971657,   # Admin 4
-}
+# Admin User IDs - Add your admin IDs here
+ADMIN_IDS = [5479445322, 7377694590]  # Replace with actual admin IDs
 
-# Helper function to check if user is admin
-def is_admin(user_id):
-    return user_id in ADMIN_IDS
+# Data storage files
+DATA_DIR = Path("quiz_bot_data")
+DATA_DIR.mkdir(exist_ok=True)
+TESTS_FILE = DATA_DIR / "tests.json"
+USERS_FILE = DATA_DIR / "users.json"
+RESULTS_FILE = DATA_DIR / "results.json"
 
-# Initialize bot and dispatcher
-bot = Bot(token=BOT_TOKEN)
-storage = MemoryStorage()
-dp = Dispatcher(storage=storage)
+# Conversation states
+(CREATING_TEST_NAME, CREATING_TEST_QUESTIONS_COUNT, CREATING_QUESTION_TEXT,
+ CREATING_ANSWER_1, CREATING_ANSWER_2, CREATING_ANSWER_3, CREATING_CORRECT_ANSWER,
+ CREATING_TIME_LIMIT, TAKING_TEST) = range(9)
 
-# Timer settings
-QUESTION_TIMEOUT = 15  # 15 seconds for each question
-active_timers = {}  # Store active question timers
+@dataclass
+class Question:
+    text: str
+    options: List[str]
+    correct_answer: int  # 0, 1, or 2
 
-# States for FSM
-class QuizCreation(StatesGroup):
-    waiting_for_quiz_name = State()
-    waiting_for_question_count = State()
-    waiting_for_question = State()
-    waiting_for_variants = State()
-    waiting_for_correct_answer = State()
+@dataclass
+class Test:
+    id: str
+    name: str
+    questions: List[Question]
+    time_limit: int  # seconds per question
+    created_by: int
+    created_at: str
 
-class QuizTaking(StatesGroup):
-    waiting_for_name = State()
-    taking_quiz = State()
+@dataclass
+class User:
+    user_id: int
+    username: str
+    first_name: str
+    last_name: str
+    registered_at: str
 
-# Data storage (in production, use a database)
-quizzes = {}
-quiz_results = {}
-users = {}
-bi_weekly_rankings = {}  # Store bi-weekly ranking data
+@dataclass
+class TestResult:
+    user_id: int
+    username: str
+    test_id: str
+    test_name: str
+    score: int
+    total_questions: int
+    answers: List[Optional[int]]  # None for unanswered
+    completed_at: str
+    time_taken: int  # seconds
 
-class BiWeeklyManager:
-    @staticmethod
-    def get_current_bi_week():
-        """Get current bi-weekly period"""
-        now = datetime.now()
-        year = now.year
+class QuizBot:
+    def __init__(self):
+        self.tests: Dict[str, Test] = {}
+        self.users: Dict[int, User] = {}
+        self.results: List[TestResult] = []
+        self.load_data()
         
-        # Calculate which bi-week of the year we're in
-        start_of_year = datetime(year, 1, 1)
-        days_passed = (now - start_of_year).days
-        bi_week_number = (days_passed // 14) + 1
+        # Track ongoing test sessions
+        self.test_sessions: Dict[int, dict] = {}
+
+    def load_data(self):
+        """Load data from JSON files"""
+        try:
+            if TESTS_FILE.exists():
+                with open(TESTS_FILE, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                    for test_data in data:
+                        questions = [Question(**q) for q in test_data['questions']]
+                        test = Test(**{**test_data, 'questions': questions})
+                        self.tests[test.id] = test
+        except Exception as e:
+            logger.error(f"Error loading tests: {e}")
+
+        try:
+            if USERS_FILE.exists():
+                with open(USERS_FILE, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                    for user_data in data:
+                        user = User(**user_data)
+                        self.users[user.user_id] = user
+        except Exception as e:
+            logger.error(f"Error loading users: {e}")
+
+        try:
+            if RESULTS_FILE.exists():
+                with open(RESULTS_FILE, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                    self.results = [TestResult(**r) for r in data]
+        except Exception as e:
+            logger.error(f"Error loading results: {e}")
+
+    def save_data(self):
+        """Save data to JSON files"""
+        try:
+            # Save tests
+            tests_data = []
+            for test in self.tests.values():
+                test_dict = asdict(test)
+                tests_data.append(test_dict)
+            with open(TESTS_FILE, 'w', encoding='utf-8') as f:
+                json.dump(tests_data, f, ensure_ascii=False, indent=2)
+
+            # Save users
+            users_data = [asdict(user) for user in self.users.values()]
+            with open(USERS_FILE, 'w', encoding='utf-8') as f:
+                json.dump(users_data, f, ensure_ascii=False, indent=2)
+
+            # Save results
+            results_data = [asdict(result) for result in self.results]
+            with open(RESULTS_FILE, 'w', encoding='utf-8') as f:
+                json.dump(results_data, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            logger.error(f"Error saving data: {e}")
+
+    def generate_test_code(self) -> str:
+        """Generate unique test code"""
+        while True:
+            code = ''.join(random.choices(string.ascii_uppercase + string.digits, k=6))
+            if code not in self.tests:
+                return code
+
+    def register_user(self, user):
+        """Register or update user information"""
+        if user.id not in self.users:
+            self.users[user.id] = User(
+                user_id=user.id,
+                username=user.username or "",
+                first_name=user.first_name or "",
+                last_name=user.last_name or "",
+                registered_at=datetime.now().isoformat()
+            )
+            self.save_data()
+
+    def is_admin(self, user_id: int) -> bool:
+        """Check if user is admin"""
+        return user_id in ADMIN_IDS
+
+    def get_weekly_ranking(self) -> List[dict]:
+        """Get weekly ranking of users"""
+        week_ago = datetime.now() - timedelta(days=7)
+        week_results = [
+            r for r in self.results
+            if datetime.fromisoformat(r.completed_at) > week_ago
+        ]
         
-        return f"{year}-BW{bi_week_number:02d}"
-    
-    @staticmethod
-    def get_bi_week_dates(bi_week_id):
-        """Get start and end dates for a bi-weekly period"""
-        year, bw_part = bi_week_id.split('-BW')
-        year = int(year)
-        bi_week_num = int(bw_part)
+        # Calculate scores per user
+        user_scores = {}
+        for result in week_results:
+            if result.user_id not in user_scores:
+                user_scores[result.user_id] = {
+                    'username': result.username,
+                    'total_score': 0,
+                    'tests_taken': 0
+                }
+            user_scores[result.user_id]['total_score'] += result.score
+            user_scores[result.user_id]['tests_taken'] += 1
         
-        start_of_year = datetime(year, 1, 1)
-        bi_week_start = start_of_year + timedelta(days=(bi_week_num - 1) * 14)
-        bi_week_end = bi_week_start + timedelta(days=13, hours=23, minutes=59, seconds=59)
-        
-        return bi_week_start, bi_week_end
-    
-    @staticmethod
-    def update_bi_weekly_ranking(user_id, user_name, username, score, total, quiz_name):
-        """Update bi-weekly ranking for a user"""
-        current_bi_week = BiWeeklyManager.get_current_bi_week()
-        
-        if current_bi_week not in bi_weekly_rankings:
-            bi_weekly_rankings[current_bi_week] = {}
-        
-        if user_id not in bi_weekly_rankings[current_bi_week]:
-            bi_weekly_rankings[current_bi_week][user_id] = {
-                'name': user_name,
-                'username': username,
-                'total_score': 0,
-                'total_questions': 0,
-                'quiz_count': 0,
-                'quizzes': [],
-                'first_attempt': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-            }
-        
-        user_data = bi_weekly_rankings[current_bi_week][user_id]
-        user_data['name'] = user_name  # Update name in case it changed
-        user_data['username'] = username  # Update username
-        user_data['total_score'] += score
-        user_data['total_questions'] += total
-        user_data['quiz_count'] += 1
-        user_data['quizzes'].append({
-            'quiz_name': quiz_name,
-            'score': score,
-            'total': total,
-            'percentage': round((score/total)*100, 1),
-            'date': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-        })
-        user_data['last_attempt'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-        user_data['average_percentage'] = round((user_data['total_score']/user_data['total_questions'])*100, 1)
-    
-    @staticmethod
-    def get_current_bi_weekly_ranking():
-        """Get current bi-weekly ranking sorted by performance"""
-        current_bi_week = BiWeeklyManager.get_current_bi_week()
-        
-        if current_bi_week not in bi_weekly_rankings:
-            return []
-        
-        ranking_data = []
-        for user_id, data in bi_weekly_rankings[current_bi_week].items():
-            ranking_data.append({
+        # Sort by total score
+        ranking = []
+        for user_id, data in user_scores.items():
+            ranking.append({
                 'user_id': user_id,
-                'name': data['name'],
                 'username': data['username'],
                 'total_score': data['total_score'],
-                'total_questions': data['total_questions'],
-                'quiz_count': data['quiz_count'],
-                'average_percentage': data['average_percentage'],
-                'quizzes': data['quizzes']
+                'tests_taken': data['tests_taken'],
+                'average': round(data['total_score'] / data['tests_taken'], 2)
             })
         
-        # Sort by average percentage (descending), then by total score (descending)
-        ranking_data.sort(key=lambda x: (x['average_percentage'], x['total_score']), reverse=True)
-        return ranking_data
-    
-    @staticmethod
-    def get_previous_bi_weekly_ranking():
-        """Get previous bi-weekly ranking"""
-        current_bi_week = BiWeeklyManager.get_current_bi_week()
-        year, bw_part = current_bi_week.split('-BW')
-        year = int(year)
-        bi_week_num = int(bw_part)
-        
-        if bi_week_num > 1:
-            prev_bi_week = f"{year}-BW{bi_week_num-1:02d}"
-        else:
-            prev_bi_week = f"{year-1}-BW26"  # Last bi-week of previous year
-        
-        if prev_bi_week not in bi_weekly_rankings:
-            return []
-        
-        ranking_data = []
-        for user_id, data in bi_weekly_rankings[prev_bi_week].items():
-            ranking_data.append({
-                'user_id': user_id,
-                'name': data['name'],
-                'username': data['username'],
-                'average_percentage': data['average_percentage'],
-                'total_score': data['total_score'],
-                'quiz_count': data['quiz_count']
-            })
-        
-        ranking_data.sort(key=lambda x: (x['average_percentage'], x['total_score']), reverse=True)
-        return ranking_data
-    
-    @staticmethod
-    def compare_rankings():
-        """Compare current and previous bi-weekly rankings"""
-        current_ranking = BiWeeklyManager.get_current_bi_weekly_ranking()
-        previous_ranking = BiWeeklyManager.get_previous_bi_weekly_ranking()
-        
-        # Create position maps
-        current_positions = {user['user_id']: i+1 for i, user in enumerate(current_ranking)}
-        previous_positions = {user['user_id']: i+1 for i, user in enumerate(previous_ranking)}
-        
-        comparison = []
-        for user in current_ranking:
-            user_id = user['user_id']
-            current_pos = current_positions[user_id]
-            previous_pos = previous_positions.get(user_id, None)
-            
-            if previous_pos is None:
-                change = "🆕 Yangi"
-            elif current_pos < previous_pos:
-                change = f"📈 +{previous_pos - current_pos}"
-            elif current_pos > previous_pos:
-                change = f"📉 -{current_pos - previous_pos}"
-            else:
-                change = "➡️ O'zgarish yo'q"
-            
-            comparison.append({
-                'user': user,
-                'current_position': current_pos,
-                'previous_position': previous_pos,
-                'change': change
-            })
-        
-        return comparison
+        ranking.sort(key=lambda x: x['total_score'], reverse=True)
+        return ranking
 
-class QuizTimer:
-    @staticmethod
-    async def start_question_timer(user_id, state: FSMContext):
-        """Start timer for current question"""
-        # Cancel existing timer if any
-        await QuizTimer.cancel_timer(user_id)
-        
-        # Create new timer
-        timer_task = asyncio.create_task(QuizTimer.question_timeout(user_id, state))
-        active_timers[user_id] = timer_task
-        
-        return timer_task
-    
-    @staticmethod
-    async def cancel_timer(user_id):
-        """Cancel active timer for user"""
-        if user_id in active_timers:
-            timer_task = active_timers[user_id]
-            if not timer_task.done():
-                timer_task.cancel()
-            del active_timers[user_id]
-    
-    @staticmethod
-    async def question_timeout(user_id, state: FSMContext):
-        """Handle question timeout"""
-        try:
-            await asyncio.sleep(QUESTION_TIMEOUT)
-            
-            # Check if user is still taking quiz
-            current_state = await state.get_state()
-            if current_state == QuizTaking.taking_quiz.state:
-                data = await state.get_data()
-                quiz = data['quiz']
-                current_question = data['current_question']
-                answers = data.get('answers', [])
-                score = data.get('score', 0)
-                
-                # Mark current question as unanswered
-                answers.append({
-                    'question': quiz['questions'][current_question]['question'],
-                    'selected': None,  # No answer selected
-                    'correct': quiz['questions'][current_question]['correct_answer'],
-                    'is_correct': False,
-                    'timeout': True
-                })
-                
-                current_question += 1
-                
-                if current_question < len(quiz['questions']):
-                    # Move to next question
-                    question = quiz['questions'][current_question]
-                    keyboard = InlineKeyboardMarkup(inline_keyboard=[
-                        [InlineKeyboardButton(text=f"A) {question['variants'][0]}", callback_data="answer_0")],
-                        [InlineKeyboardButton(text=f"B) {question['variants'][1]}", callback_data="answer_1")],
-                        [InlineKeyboardButton(text=f"C) {question['variants'][2]}", callback_data="answer_2")]
-                    ])
-                    
-                    await bot.edit_message_text(
-                        chat_id=user_id,
-                        message_id=data.get('current_message_id'),
-                        text=f"⏰ Vaqt tugadi! Keyingi savol...\n\n"
-                             f"📝 {current_question + 1}-savol {len(quiz['questions'])} dan:\n"
-                             f"⏳ {QUESTION_TIMEOUT} soniya\n\n"
-                             f"{question['question']}",
-                        reply_markup=keyboard
-                    )
-                    
-                    await state.update_data(
-                        current_question=current_question,
-                        answers=answers,
-                        score=score
-                    )
-                    
-                    # Start timer for next question
-                    await QuizTimer.start_question_timer(user_id, state)
-                else:
-                    # Quiz finished
-                    await QuizTimer.finish_quiz(user_id, state, data, answers, score)
-        
-        except asyncio.CancelledError:
-            # Timer was cancelled, ignore
-            pass
-        except Exception as e:
-            logging.error(f"Timer error for user {user_id}: {e}")
-    
-    @staticmethod
-    async def finish_quiz(user_id, state: FSMContext, data, answers, score):
-        """Finish quiz and show results"""
-        try:
-            quiz_code = data['quiz_code']
-            user_name = data['user_name']
-            quiz = data['quiz']
-            total_questions = len(quiz['questions'])
-            
-            # Get user info
-            try:
-                user_info = await bot.get_chat(user_id)
-                username = user_info.username
-            except:
-                username = None
-            
-            # Save result
-            QuizManager.save_result(
-                quiz_code, user_name, user_id, username, score, total_questions, answers
-            )
-            
-            # Calculate statistics
-            answered_count = sum(1 for answer in answers if not answer.get('timeout', False))
-            timeout_count = total_questions - answered_count
-            percentage = round((score/total_questions) * 100, 1)
-            
-            # Show results to user
-            result_text = f"🎉 Test tugatildi!\n\n"
-            result_text += f"👤 Ism: {user_name}\n"
-            result_text += f"📊 Ball: {score}/{total_questions}\n"
-            result_text += f"📈 Foiz: {percentage}%\n"
-            result_text += f"✅ Javob berildi: {answered_count}\n"
-            result_text += f"⏰ Vaqt tugadi: {timeout_count}\n\n"
-            
-            if score == total_questions:
-                result_text += "🏆 Mukammal ball! Tabriklaymiz!"
-            elif score >= total_questions * 0.8:
-                result_text += "🎯 Ajoyib ish! Zo'r natija!"
-            elif score >= total_questions * 0.6:
-                result_text += "👍 Yaxshi ish! Davom eting!"
-            else:
-                result_text += "📚 O'qishni davom ettiring va qayta urinib ko'ring!"
-            
-            result_text += f"\n\n🏆 Ikki haftalik reytingga qo'shildi!"
-            
-            await bot.send_message(user_id, result_text)
-            
-            # Send results to owner
-            current_ranking = BiWeeklyManager.get_current_bi_weekly_ranking()
-            user_position = None
-            for i, user in enumerate(current_ranking, 1):
-                if user['user_id'] == user_id:
-                    user_position = i
-                    break
-            
-            owner_text = f"📊 Yangi Test Natijasi!\n\n"
-            owner_text += f"🎯 Test: {quiz['name']}\n"
-            owner_text += f"👤 Talaba: {user_name}\n"
-            if username:
-                owner_text += f"📱 Username: @{username}\n"
-            else:
-                owner_text += f"📱 Username yo'q\n"
-            owner_text += f"🆔 ID: {user_id}\n"
-            owner_text += f"📊 Ball: {score}/{total_questions} ({percentage}%)\n"
-            owner_text += f"✅ Javob berildi: {answered_count}\n"
-            owner_text += f"⏰ Vaqt tugadi: {timeout_count}\n"
-            owner_text += f"📅 Sana: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
-            
-            if user_position:
-                owner_text += f"\n🏆 Ikki haftalik reytingda: {user_position}-o'rin"
-            
-            # Send to all admins
-            for admin_id in ADMIN_IDS:
-                try:
-                    await bot.send_message(admin_id, owner_text)
-                except Exception as e:
-                    logging.error(f"Failed to send message to admin {admin_id}: {e}")
-            
-            # Clean up
-            await QuizTimer.cancel_timer(user_id)
-            await state.clear()
-            
-        except Exception as e:
-            logging.error(f"Error finishing quiz for user {user_id}: {e}")
+# Initialize bot instance
+quiz_bot = QuizBot()
 
-class QuizManager:
-    @staticmethod
-    def generate_quiz_code():
-        return ''.join(random.choices(string.ascii_uppercase + string.digits, k=6))
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Start command handler"""
+    user = update.effective_user
+    quiz_bot.register_user(user)
     
-    @staticmethod
-    def save_quiz(quiz_data):
-        code = QuizManager.generate_quiz_code()
-        while code in quizzes:
-            code = QuizManager.generate_quiz_code()
-        quizzes[code] = quiz_data
-        return code
-    
-    @staticmethod
-    def get_quiz(code):
-        return quizzes.get(code)
-    
-    @staticmethod
-    def save_result(quiz_code, user_name, user_id, username, score, total, answers):
-        if quiz_code not in quiz_results:
-            quiz_results[quiz_code] = []
+    if quiz_bot.is_admin(user.id):
+        keyboard = [
+            [InlineKeyboardButton("📝 Test Yaratish", callback_data="create_test")],
+            [InlineKeyboardButton("👥 Foydalanuvchilar", callback_data="users"),
+             InlineKeyboardButton("📊 Natijalar", callback_data="results")],
+            [InlineKeyboardButton("🏆 Haftalik Reyting", callback_data="weekly_ranking"),
+             InlineKeyboardButton("📋 Mening Testlarim", callback_data="my_tests")]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
         
-        result = {
-            'user_name': user_name,
-            'user_id': user_id,
-            'username': username,
-            'score': score,
-            'total': total,
-            'answers': answers,
-            'date': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-        }
-        quiz_results[quiz_code].append(result)
-        
-        # Save user info
-        users[user_id] = {
-            'name': user_name,
-            'username': username,
-            'last_seen': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-        }
-        
-        # Update bi-weekly ranking
-        quiz_name = quizzes[quiz_code]['name']
-        BiWeeklyManager.update_bi_weekly_ranking(user_id, user_name, username, score, total, quiz_name)
-
-# Owner keyboard
-def get_owner_keyboard():
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📝 Test yaratish", callback_data="create_quiz")],
-        [InlineKeyboardButton(text="📊 Testlar natijalari", callback_data="view_results")],
-        [InlineKeyboardButton(text="🏆 Ikki haftalik reyting", callback_data="bi_weekly_ranking")],
-        [InlineKeyboardButton(text="📈 Reyting taqqoslash", callback_data="compare_rankings")],
-        [InlineKeyboardButton(text="👥 Foydalanuvchilar", callback_data="view_users")],
-        [InlineKeyboardButton(text="🗂️ Testlarim", callback_data="my_quizzes")]
-    ])
-    return keyboard
-
-# Quiz selection keyboard for results
-def get_quiz_selection_keyboard():
-    keyboard = []
-    for code, quiz in quizzes.items():
-        keyboard.append([InlineKeyboardButton(
-            text=f"🎯 {quiz['name']} ({code})",
-            callback_data=f"quiz_results_{code}"
-        )])
-    
-    if not keyboard:
-        return None
-    
-    keyboard.append([InlineKeyboardButton(text="🔙 Orqaga", callback_data="back_to_menu")])
-    return InlineKeyboardMarkup(inline_keyboard=keyboard)
-
-# Ranking keyboard
-def get_ranking_keyboard():
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📊 Joriy ikki hafta", callback_data="current_ranking")],
-        [InlineKeyboardButton(text="📋 Oldingi ikki hafta", callback_data="previous_ranking")],
-        [InlineKeyboardButton(text="🔙 Orqaga", callback_data="back_to_menu")]
-    ])
-    return keyboard
-
-# Start command
-@dp.message(Command("start"))
-async def start_command(message: types.Message):
-    if is_admin(message.from_user.id):
-        await message.answer(
-            "🎮 Test Botga Xush kelibsiz!\n\n"
-            "Siz adminsiz. Qanday ish qilmoqchisiz:",
-            reply_markup=get_owner_keyboard()
+        await update.message.reply_text(
+            f"🎯 <b>Admin paneliga xush kelibsiz!</b>\n\n"
+            f"👋 Salom, {user.first_name}!\n"
+            f"📊 Siz admin sifatida barcha imkoniyatlardan foydalanishingiz mumkin.",
+            reply_markup=reply_markup,
+            parse_mode='HTML'
         )
     else:
-        await message.answer(
-            "🎮 Test Botga Xush kelibsiz!\n\n"
-            "Test olish uchun quyidagi buyruqdan foydalaning:\n"
-            "/quiz [CODE]\n\n"
-            "Misol: /quiz ABC123\n\n"
-            f"⏰ Har bir savol uchun {QUESTION_TIMEOUT} soniya vaqt beriladi!\n\n"
-            "Test yaratuvchisidan test kodini oling!"
+        await update.message.reply_text(
+            f"👋 <b>Quiz botga xush kelibsiz!</b>\n\n"
+            f"Salom, {user.first_name}!\n\n"
+            f"📝 Test topshirish uchun test kodini yuboring.\n"
+            f"Masalan: <code>ABC123</code>\n\n"
+            f"💡 Test kodini adminlardan oling.",
+            parse_mode='HTML'
         )
 
-# Quiz command for users
-@dp.message(Command("quiz"))
-async def quiz_command(message: types.Message, state: FSMContext):
-    if is_admin(message.from_user.id):
-        await message.answer("❌ Adminlar test ololmaydi. Testlarni boshqarish uchun menyudan foydalaning.")
+async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle button callbacks"""
+    query = update.callback_query
+    await query.answer()
+    
+    user_id = query.from_user.id
+    
+    if not quiz_bot.is_admin(user_id):
+        await query.edit_message_text("❌ Sizda bu amalni bajarish huquqi yo'q!")
         return
     
-    # Cancel any existing timer
-    await QuizTimer.cancel_timer(message.from_user.id)
-    
-    args = message.text.split()
-    if len(args) != 2:
-        await message.answer("❌ Iltimos, test kodini taqdim eting.\nMisol: /quiz ABC123")
-        return
-    
-    quiz_code = args[1].upper()
-    quiz = QuizManager.get_quiz(quiz_code)
-    
-    if not quiz:
-        await message.answer("❌ Test topilmadi. Iltimos, kodni tekshiring.")
-        return
-    
-    await state.update_data(quiz_code=quiz_code, quiz=quiz)
-    await message.answer(
-        f"🎯 Testga xush kelibsiz: {quiz['name']}\n\n"
-        f"📝 Savollar: {len(quiz['questions'])}\n"
-        f"⏰ Har bir savol uchun {QUESTION_TIMEOUT} soniya vaqt\n\n"
-        "Iltimos, to'liq ismingizni kiriting:"
-    )
-    await state.set_state(QuizTaking.waiting_for_name)
-
-# Handle owner callbacks
-@dp.callback_query(lambda c: is_admin(c.from_user.id))
-async def handle_owner_callbacks(callback: CallbackQuery, state: FSMContext):
-    if callback.data == "create_quiz":
-        await callback.message.edit_text(
-            "📝 Yangi test yaratilyapti...\n\n"
-            "Iltimos, test nomini kiriting:"
+    if query.data == "create_test":
+        await query.edit_message_text(
+            "📝 <b>Yangi test yaratish</b>\n\n"
+            "Test nomini kiriting:",
+            parse_mode='HTML'
         )
-        await state.set_state(QuizCreation.waiting_for_quiz_name)
+        return CREATING_TEST_NAME
     
-    elif callback.data == "view_results":
-        quiz_keyboard = get_quiz_selection_keyboard()
-        if quiz_keyboard:
-            await callback.message.edit_text(
-                "📊 Natijalarni ko'rish uchun testni tanlang:",
-                reply_markup=quiz_keyboard
-            )
-        else:
-            await callback.message.edit_text(
-                "📊 Hech qanday test topilmadi.\n\n"
-                "Avval test yarating!",
-                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                    [InlineKeyboardButton(text="🔙 Orqaga", callback_data="back_to_menu")]
-                ])
-            )
-    
-    elif callback.data == "bi_weekly_ranking":
-        await callback.message.edit_text(
-            "🏆 Ikki haftalik reyting\n\n"
-            "Qaysi davr reytingini ko'rmoqchisiz?",
-            reply_markup=get_ranking_keyboard()
-        )
-    
-    elif callback.data == "current_ranking":
-        current_ranking = BiWeeklyManager.get_current_bi_weekly_ranking()
-        current_bi_week = BiWeeklyManager.get_current_bi_week()
-        
-        if current_ranking:
-            start_date, end_date = BiWeeklyManager.get_bi_week_dates(current_bi_week)
-            ranking_text = f"🏆 Joriy ikki hafta reytingi\n"
-            ranking_text += f"📅 {start_date.strftime('%d.%m.%Y')} - {end_date.strftime('%d.%m.%Y')}\n\n"
-            
-            for i, user in enumerate(current_ranking[:10], 1):  # Top 10
-                medal = "🥇" if i == 1 else "🥈" if i == 2 else "🥉" if i == 3 else f"{i}."
-                ranking_text += f"{medal} {user['name']}\n"
-                if user['username']:
-                    ranking_text += f"   @{user['username']}\n"
-                ranking_text += f"   📊 {user['average_percentage']}% ({user['total_score']}/{user['total_questions']})\n"
-                ranking_text += f"   🎯 {user['quiz_count']} ta test\n\n"
-        else:
-            ranking_text = f"🏆 Joriy ikki hafta reytingi\n\n"
-            ranking_text += "Hali hech kim test topshirmagan."
-        
-        await callback.message.edit_text(
-            ranking_text,
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="🔙 Orqaga", callback_data="bi_weekly_ranking")]
-            ])
-        )
-    
-    elif callback.data == "previous_ranking":
-        previous_ranking = BiWeeklyManager.get_previous_bi_weekly_ranking()
-        
-        if previous_ranking:
-            current_bi_week = BiWeeklyManager.get_current_bi_week()
-            year, bw_part = current_bi_week.split('-BW')
-            year = int(year)
-            bi_week_num = int(bw_part)
-            
-            if bi_week_num > 1:
-                prev_bi_week = f"{year}-BW{bi_week_num-1:02d}"
-            else:
-                prev_bi_week = f"{year-1}-BW26"
-            
-            start_date, end_date = BiWeeklyManager.get_bi_week_dates(prev_bi_week)
-            ranking_text = f"🏆 Oldingi ikki hafta reytingi\n"
-            ranking_text += f"📅 {start_date.strftime('%d.%m.%Y')} - {end_date.strftime('%d.%m.%Y')}\n\n"
-            
-            for i, user in enumerate(previous_ranking[:10], 1):  # Top 10
-                medal = "🥇" if i == 1 else "🥈" if i == 2 else "🥉" if i == 3 else f"{i}."
-                ranking_text += f"{medal} {user['name']}\n"
-                if user['username']:
-                    ranking_text += f"   @{user['username']}\n"
-                ranking_text += f"   📊 {user['average_percentage']}%\n"
-                ranking_text += f"   🎯 {user['quiz_count']} ta test\n\n"
-        else:
-            ranking_text = f"🏆 Oldingi ikki hafta reytingi\n\n"
-            ranking_text += "Oldingi davr uchun ma'lumot yo'q."
-        
-        await callback.message.edit_text(
-            ranking_text,
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="🔙 Orqaga", callback_data="bi_weekly_ranking")]
-            ])
-        )
-    
-    elif callback.data == "compare_rankings":
-        comparison = BiWeeklyManager.compare_rankings()
-        
-        if comparison:
-            compare_text = f"📈 Ikki haftalik reyting taqqoslash\n\n"
-            
-            for item in comparison[:10]:  # Top 10
-                user = item['user']
-                current_pos = item['current_position']
-                change = item['change']
-                
-                medal = "🥇" if current_pos == 1 else "🥈" if current_pos == 2 else "🥉" if current_pos == 3 else f"{current_pos}."
-                compare_text += f"{medal} {user['name']} {change}\n"
-                if user['username']:
-                    compare_text += f"   @{user['username']}\n"
-                compare_text += f"   📊 {user['average_percentage']}% ({user['total_score']}/{user['total_questions']})\n\n"
-        else:
-            compare_text = "📈 Ikki haftalik reyting taqqoslash\n\n"
-            compare_text += "Taqqoslash uchun yetarli ma'lumot yo'q."
-        
-        await callback.message.edit_text(
-            compare_text,
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="🔙 Orqaga", callback_data="back_to_menu")]
-            ])
-        )
-    
-    elif callback.data == "view_users":
-        if users:
-            user_list = "👥 Ro'yxatdan o'tgan foydalanuvchilar:\n\n"
-            for user_id, user_info in users.items():
-                user_list += f"👤 {user_info['name']}\n"
-                if user_info.get('username'):
-                    user_list += f"📱 @{user_info['username']}\n"
-                else:
-                    user_list += f"📱 Username yo'q\n"
-                user_list += f"🆔 ID: {user_id}\n"
-                user_list += f"📅 Oxirgi ko'rish: {user_info['last_seen']}\n\n"
-        else:
-            user_list = "👥 Hech qanday foydalanuvchi test o'tkazmagan."
-        
-        await callback.message.edit_text(
-            user_list,
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="🔙 Orqaga", callback_data="back_to_menu")]
-            ])
-        )
-    
-    elif callback.data == "my_quizzes":
-        if quizzes:
-            quiz_list = "🗂️ Testlaringiz:\n\n"
-            for code, quiz in quizzes.items():
-                quiz_list += f"🎯 {quiz['name']}\n"
-                quiz_list += f"🔑 Kod: {code}\n"
-                quiz_list += f"❓ Savollar: {len(quiz['questions'])}\n\n"
-        else:
-            quiz_list = "🗂️ Hech qanday test yaratilmagan."
-        
-        await callback.message.edit_text(
-            quiz_list,
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="🔙 Orqaga", callback_data="back_to_menu")]
-            ])
-        )
-    
-    elif callback.data == "back_to_menu":
-        await callback.message.edit_text(
-            "🎮 Test Botga xush kelibsiz!\n\n"
-            "Siz adminsiz. Qanday ish qilmoqchisiz:",
-            reply_markup=get_owner_keyboard()
-        )
-    
-    elif callback.data.startswith("quiz_results_"):
-        quiz_code = callback.data.replace("quiz_results_", "")
-        results = quiz_results.get(quiz_code, [])
-        quiz = quizzes.get(quiz_code)
-        
-        if results:
-            results_text = f"📊 Natijalar: {quiz['name']}\n\n"
-            for i, result in enumerate(results, 1):
-                # Calculate timeout statistics
-                timeout_count = sum(1 for answer in result['answers'] if answer.get('timeout', False))
-                answered_count = result['total'] - timeout_count
-                
-                results_text += f"{i}. {result['user_name']}\n"
-                if result.get('username'):
-                    results_text += f"   @{result['username']}\n"
-                else:
-                    results_text += f"   Username yo'q\n"
-                results_text += f"   ID: {result['user_id']}\n"
-                results_text += f"   Ball: {result['score']}/{result['total']}\n"
-                results_text += f"   ✅ Javob berildi: {answered_count}\n"
-                results_text += f"   ⏰ Vaqt tugadi: {timeout_count}\n"
-                results_text += f"   Sana: {result['date']}\n\n"
-        else:
-            results_text = f"📊 Natijalar: {quiz['name']}\n\n"
-            results_text += "Hali hech kim test topshirmagan."
-        
-        await callback.message.edit_text(
-            results_text,
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="🔙 Orqaga", callback_data="view_results")]
-            ])
-        )
-    
-    await callback.answer()
-
-# Handle quiz creation states
-@dp.message(QuizCreation.waiting_for_quiz_name)
-async def process_quiz_name(message: types.Message, state: FSMContext):
-    if not is_admin(message.from_user.id):
-        return
-    
-    await state.update_data(quiz_name=message.text)
-    await message.answer(
-        f"✅ Test nomi: {message.text}\n\n"
-        "Qancha savol qo'shmoqchisiz?"
-    )
-    await state.set_state(QuizCreation.waiting_for_question_count)
-
-@dp.message(QuizCreation.waiting_for_question_count)
-async def process_question_count(message: types.Message, state: FSMContext):
-    if not is_admin(message.from_user.id):
-        return
-    
-    try:
-        count = int(message.text)
-        if count <= 0:
-            await message.answer("❌ Iltimos, musbat raqam kiriting.")
+    elif query.data == "users":
+        if not quiz_bot.users:
+            await query.edit_message_text("👥 Hozircha hech qanday foydalanuvchi yo'q.")
             return
-    except ValueError:
-        await message.answer("❌ Iltimos, to'g'ri raqam kiriting.")
-        return
+        
+        users_text = "👥 <b>Ro'yxatdan o'tgan foydalanuvchilar:</b>\n\n"
+        for i, user in enumerate(quiz_bot.users.values(), 1):
+            username = f"@{user.username}" if user.username else "Username yo'q"
+            users_text += f"{i}. {user.first_name} {user.last_name} ({username})\n"
+            users_text += f"   📅 Ro'yxatdan o'tgan: {user.registered_at[:10]}\n\n"
+        
+        await query.edit_message_text(users_text, parse_mode='HTML')
     
-    await state.update_data(
-        question_count=count,
-        current_question=1,
-        questions=[]
-    )
-    await message.answer(
-        f"📝 1-savol {count} dan:\n\n"
-        "Iltimos, savolni kiriting:"
-    )
-    await state.set_state(QuizCreation.waiting_for_question)
-
-@dp.message(QuizCreation.waiting_for_question)
-async def process_question(message: types.Message, state: FSMContext):
-    if not is_admin(message.from_user.id):
-        return
-    
-    data = await state.get_data()
-    await state.update_data(current_question_text=message.text)
-    await message.answer(
-        f"Savol: {message.text}\n\n"
-        "Endi 3 ta javob variantini kiriting, har birini alohida xabarda.\n"
-        "Variant 1 ni yuboring:"
-    )
-    await state.update_data(variants=[], variant_count=1)
-    await state.set_state(QuizCreation.waiting_for_variants)
-
-@dp.message(QuizCreation.waiting_for_variants)
-async def process_variants(message: types.Message, state: FSMContext):
-    if not is_admin(message.from_user.id):
-        return
-    
-    data = await state.get_data()
-    variants = data.get('variants', [])
-    variants.append(message.text)
-    variant_count = data.get('variant_count', 1)
-    
-    if variant_count < 3:
-        await state.update_data(variants=variants, variant_count=variant_count + 1)
-        await message.answer(f"✅ Variant {variant_count}: {message.text}\n\nVariant {variant_count + 1} ni yuboring:")
-    else:
-        await state.update_data(variants=variants)
-        variant_text = "\n".join([f"{i+1}. {v}" for i, v in enumerate(variants)])
-        await message.answer(
-            f"✅ Hamma variantlar qo'shildi:\n\n{variant_text}\n\n"
-            "Qaysi javob to'g'ri? (1, 2, yoki 3 ni kiriting):"
-        )
-        await state.set_state(QuizCreation.waiting_for_correct_answer)
-
-@dp.message(QuizCreation.waiting_for_correct_answer)
-async def process_correct_answer(message: types.Message, state: FSMContext):
-    if not is_admin(message.from_user.id):
-        return
-    
-    try:
-        correct_answer = int(message.text)
-        if correct_answer not in [1, 2, 3]:
-            await message.answer("❌ Iltimos, 1, 2, yoki 3 ni kiriting.")
+    elif query.data == "results":
+        if not quiz_bot.results:
+            await query.edit_message_text("📊 Hozircha hech qanday natija yo'q.")
             return
-    except ValueError:
-        await message.answer("❌ Iltimos, to'g'ri raqam kiriting (1, 2, yoki 3).")
-        return
-    
-    data = await state.get_data()
-    questions = data.get('questions', [])
-    
-    question_data = {
-        'question': data['current_question_text'],
-        'variants': data['variants'],
-        'correct_answer': correct_answer - 1  # Convert to 0-based index
-    }
-    questions.append(question_data)
-    
-    current_question = data['current_question']
-    question_count = data['question_count']
-    
-    if current_question < question_count:
-        await state.update_data(
-            questions=questions,
-            current_question=current_question + 1
-        )
-        await message.answer(
-            f"✅ Savol {current_question} saqlandi!\n\n"
-            f"📝 {current_question + 1}-savol {question_count} dan:\n\n"
-            "Iltimos, savolni kiriting:"
-        )
-        await state.set_state(QuizCreation.waiting_for_question)
-    else:
-        # Quiz creation complete
-        quiz_data = {
-            'name': data['quiz_name'],
-            'questions': questions,
-            'created_date': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-        }
         
-        quiz_code = QuizManager.save_quiz(quiz_data)
+        # Show last 10 results
+        results_text = "📊 <b>So'nggi natijalar:</b>\n\n"
+        for result in quiz_bot.results[-10:]:
+            percentage = round((result.score / result.total_questions) * 100, 1)
+            results_text += f"👤 {result.username}\n"
+            results_text += f"📝 Test: {result.test_name}\n"
+            results_text += f"🎯 Natija: {result.score}/{result.total_questions} ({percentage}%)\n"
+            results_text += f"📅 Sana: {result.completed_at[:16]}\n\n"
         
-        await message.answer(
-            f"🎉 Test muvaffaqiyatli yaratildi!\n\n"
-            f"📝 Test: {quiz_data['name']}\n"
-            f"🔑 Kod: {quiz_code}\n"
-            f"❓ Savollar: {len(questions)}\n"
-            f"⏰ Har savol uchun: {QUESTION_TIMEOUT} soniya\n\n"
-            f"Ushbu kodni foydalanuvchilar bilan ulashing:\n"
-            f"/quiz {quiz_code}",
-            reply_markup=get_owner_keyboard()
-        )
-        await state.clear()
-
-# Handle quiz taking states
-@dp.message(QuizTaking.waiting_for_name)
-async def process_user_name(message: types.Message, state: FSMContext):
-    if is_admin(message.from_user.id):
-        return
+        await query.edit_message_text(results_text, parse_mode='HTML')
     
-    name = message.text.strip()
-    if len(name) < 2:
-        await message.answer("❌ Iltimos, to'liq ismingizni kiriting (kamida 2 ta belgi).")
-        return
-    
-    data = await state.get_data()
-    await state.update_data(
-        user_name=name,
-        current_question=0,
-        answers=[],
-        score=0
-    )
-    
-    quiz = data['quiz']
-    question = quiz['questions'][0]
-    
-    # Create answer buttons
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=f"A) {question['variants'][0]}", callback_data="answer_0")],
-        [InlineKeyboardButton(text=f"B) {question['variants'][1]}", callback_data="answer_1")],
-        [InlineKeyboardButton(text=f"C) {question['variants'][2]}", callback_data="answer_2")]
-    ])
-    
-    sent_message = await message.answer(
-        f"👋 Salom, {name}!\n\n"
-        f"🎯 Test: {quiz['name']}\n\n"
-        f"📝 1-savol {len(quiz['questions'])} dan:\n"
-        f"⏳ {QUESTION_TIMEOUT} soniya\n\n"
-        f"{question['question']}",
-        reply_markup=keyboard
-    )
-    
-    # Store message ID for editing later
-    await state.update_data(current_message_id=sent_message.message_id)
-    await state.set_state(QuizTaking.taking_quiz)
-    
-    # Start timer for first question
-    await QuizTimer.start_question_timer(message.from_user.id, state)
-
-# Handle quiz answers
-@dp.callback_query(lambda c: c.data.startswith("answer_"))
-async def handle_quiz_answers(callback: CallbackQuery, state: FSMContext):
-    if is_admin(callback.from_user.id):
-        await callback.answer("❌ Admin test yecha olmaydi.")
-        return
-    
-    # Cancel the timer since user answered
-    await QuizTimer.cancel_timer(callback.from_user.id)
-    
-    data = await state.get_data()
-    quiz = data['quiz']
-    current_question = data['current_question']
-    answers = data.get('answers', [])
-    score = data.get('score', 0)
-    
-    # Get selected answer
-    selected_answer = int(callback.data.split('_')[1])
-    correct_answer = quiz['questions'][current_question]['correct_answer']
-    
-    # Check if answer is correct
-    is_correct = selected_answer == correct_answer
-    if is_correct:
-        score += 1
-    
-    answers.append({
-        'question': quiz['questions'][current_question]['question'],
-        'selected': selected_answer,
-        'correct': correct_answer,
-        'is_correct': is_correct,
-        'timeout': False
-    })
-    
-    current_question += 1
-    
-    if current_question < len(quiz['questions']):
-        # Next question
-        question = quiz['questions'][current_question]
-        keyboard = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text=f"A) {question['variants'][0]}", callback_data="answer_0")],
-            [InlineKeyboardButton(text=f"B) {question['variants'][1]}", callback_data="answer_1")],
-            [InlineKeyboardButton(text=f"C) {question['variants'][2]}", callback_data="answer_2")]
-        ])
+    elif query.data == "weekly_ranking":
+        ranking = quiz_bot.get_weekly_ranking()
+        if not ranking:
+            await query.edit_message_text("🏆 Haftalik reyting bo'sh.")
+            return
         
-        await callback.message.edit_text(
-            f"📝 {current_question + 1}-savol {len(quiz['questions'])} dan:\n"
-            f"⏳ {QUESTION_TIMEOUT} soniya\n\n"
-            f"{question['question']}",
-            reply_markup=keyboard
-        )
-        
-        await state.update_data(
-            current_question=current_question,
-            answers=answers,
-            score=score
-        )
-        
-        # Start timer for next question
-        await QuizTimer.start_question_timer(callback.from_user.id, state)
-    else:
-        # Quiz finished
-        quiz_code = data['quiz_code']
-        user_name = data['user_name']
-        total_questions = len(quiz['questions'])
-        
-        # Save result
-        QuizManager.save_result(
-            quiz_code, user_name, callback.from_user.id, 
-            callback.from_user.username,
-            score, total_questions, answers
-        )
-        
-        # Calculate statistics
-        answered_count = sum(1 for answer in answers if not answer.get('timeout', False))
-        timeout_count = total_questions - answered_count
-        percentage = round((score/total_questions) * 100, 1)
-        
-        # Show results to user
-        result_text = f"🎉 Test tugatildi!\n\n"
-        result_text += f"👤 Ism: {user_name}\n"
-        result_text += f"📊 Ball: {score}/{total_questions}\n"
-        result_text += f"📈 Foiz: {percentage}%\n"
-        result_text += f"✅ Javob berildi: {answered_count}\n"
-        result_text += f"⏰ Vaqt tugadi: {timeout_count}\n\n"
-        
-        if score == total_questions:
-            result_text += "🏆 Mukammal ball! Tabriklaymiz!"
-        elif score >= total_questions * 0.8:
-            result_text += "🎯 Ajoyib ish! Zo'r natija!"
-        elif score >= total_questions * 0.6:
-            result_text += "👍 Yaxshi ish! Davom eting!"
-        else:
-            result_text += "📚 O'qishni davom ettiring va qayta urinib ko'ring!"
-        
-        result_text += f"\n\n🏆 Ikki haftalik reytingga qo'shildi!"
-        
-        await callback.message.edit_text(result_text)
-        
-        # Send results to owner with bi-weekly ranking info
-        current_ranking = BiWeeklyManager.get_current_bi_weekly_ranking()
-        user_position = None
-        for i, user in enumerate(current_ranking, 1):
-            if user['user_id'] == callback.from_user.id:
-                user_position = i
-                break
-        
-        owner_text = f"📊 Yangi Test Natijasi!\n\n"
-        owner_text += f"🎯 Test: {quiz['name']}\n"
-        owner_text += f"👤 Talaba: {user_name}\n"
-        if callback.from_user.username:
-            owner_text += f"📱 Username: @{callback.from_user.username}\n"
-        else:
-            owner_text += f"📱 Username yo'q\n"
-        owner_text += f"🆔 ID: {callback.from_user.id}\n"
-        owner_text += f"📊 Ball: {score}/{total_questions} ({percentage}%)\n"
-        owner_text += f"✅ Javob berildi: {answered_count}\n"
-        owner_text += f"⏰ Vaqt tugadi: {timeout_count}\n"
-        owner_text += f"📅 Sana: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
-        
-        if user_position:
-            owner_text += f"\n🏆 Ikki haftalik reytingda: {user_position}-o'rin"
-        
-        # Send to all admins
-        for admin_id in ADMIN_IDS:
-            try:
-                await bot.send_message(admin_id, owner_text)
-            except Exception as e:
-                logging.error(f"Failed to send message to admin {admin_id}: {e}")
-        
-        await state.clear()
-    
-    await callback.answer()
-
-# Ranking command for all users
-@dp.message(Command("ranking"))
-async def ranking_command(message: types.Message):
-    current_ranking = BiWeeklyManager.get_current_bi_weekly_ranking()
-    current_bi_week = BiWeeklyManager.get_current_bi_week()
-    
-    if current_ranking:
-        start_date, end_date = BiWeeklyManager.get_bi_week_dates(current_bi_week)
-        ranking_text = f"🏆 Joriy ikki hafta reytingi\n"
-        ranking_text += f"📅 {start_date.strftime('%d.%m.%Y')} - {end_date.strftime('%d.%m.%Y')}\n\n"
-        
-        # Show different amount based on user type
-        show_count = 20 if is_admin(message.from_user.id) else 10
-        
-        for i, user in enumerate(current_ranking[:show_count], 1):
+        ranking_text = "🏆 <b>Haftalik Reyting:</b>\n\n"
+        for i, user_data in enumerate(ranking[:10], 1):
             medal = "🥇" if i == 1 else "🥈" if i == 2 else "🥉" if i == 3 else f"{i}."
-            ranking_text += f"{medal} {user['name']}\n"
-            ranking_text += f"   📊 {user['average_percentage']}% ({user['total_score']}/{user['total_questions']})\n"
-            ranking_text += f"   🎯 {user['quiz_count']} ta test\n"
-            
-            # Highlight current user
-            if user['user_id'] == message.from_user.id:
-                ranking_text += "   ⭐ SIZ\n"
-            ranking_text += "\n"
+            ranking_text += f"{medal} {user_data['username']}\n"
+            ranking_text += f"   📊 Umumiy ball: {user_data['total_score']}\n"
+            ranking_text += f"   📝 Testlar soni: {user_data['tests_taken']}\n"
+            ranking_text += f"   📈 O'rtacha: {user_data['average']}\n\n"
         
-        # If user is not in top 10, show their position
-        if not is_admin(message.from_user.id):
-            user_position = None
-            user_data = None
-            for i, user in enumerate(current_ranking, 1):
-                if user['user_id'] == message.from_user.id:
-                    user_position = i
-                    user_data = user
-                    break
-            
-            if user_position and user_position > 10:
-                ranking_text += f"...\n\n"
-                ranking_text += f"{user_position}. {user_data['name']} ⭐ SIZ\n"
-                ranking_text += f"   📊 {user_data['average_percentage']}% ({user_data['total_score']}/{user_data['total_questions']})\n"
-                ranking_text += f"   🎯 {user_data['quiz_count']} ta test\n"
-    else:
-        ranking_text = f"🏆 Joriy ikki hafta reytingi\n\n"
-        ranking_text += "Hali hech kim test topshirmagan."
+        await query.edit_message_text(ranking_text, parse_mode='HTML')
     
-    await message.answer(ranking_text)
+    elif query.data == "my_tests":
+        if not quiz_bot.tests:
+            await query.edit_message_text("📋 Hozircha hech qanday test yaratilmagan.")
+            return
+        
+        tests_text = "📋 <b>Barcha testlar:</b>\n\n"
+        for test in quiz_bot.tests.values():
+            creator = quiz_bot.users.get(test.created_by, None)
+            creator_name = creator.first_name if creator else "Noma'lum"
+            tests_text += f"🔑 Kod: <code>{test.id}</code>\n"
+            tests_text += f"📝 Nom: {test.name}\n"
+            tests_text += f"❓ Savollar: {len(test.questions)}\n"
+            tests_text += f"⏰ Vaqt: {test.time_limit} soniya\n"
+            tests_text += f"👤 Yaratuvchi: {creator_name}\n"
+            tests_text += f"📅 Yaratilgan: {test.created_at[:10]}\n\n"
+        
+        await query.edit_message_text(tests_text, parse_mode='HTML')
 
-# Handle user disconnection/cancellation
-@dp.message()
-async def handle_other_messages(message: types.Message, state: FSMContext):
-    current_state = await state.get_state()
+async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle text messages"""
+    user = update.effective_user
+    text = update.message.text.strip()
     
-    # If user is taking quiz and sends a message, cancel timer
-    if current_state == QuizTaking.taking_quiz.state and not is_admin(message.from_user.id):
-        await QuizTimer.cancel_timer(message.from_user.id)
-        await message.answer(
-            "❌ Test bekor qilindi!\n\n"
-            "Qaytadan test olish uchun /quiz buyrug'idan foydalaning."
+    quiz_bot.register_user(user)
+    
+    # Check if it's a test code
+    if len(text) == 6 and text.upper() in quiz_bot.tests:
+        test_code = text.upper()
+        test = quiz_bot.tests[test_code]
+        
+        keyboard = [
+            [InlineKeyboardButton("✅ Ha, tayyorman!", callback_data=f"start_test_{test_code}")],
+            [InlineKeyboardButton("❌ Bekor qilish", callback_data="cancel")]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        await update.message.reply_text(
+            f"📝 <b>Test topildi!</b>\n\n"
+            f"🏷️ Nom: {test.name}\n"
+            f"❓ Savollar soni: {len(test.questions)}\n"
+            f"⏰ Har bir savol uchun vaqt: {test.time_limit} soniya\n\n"
+            f"Test boshlashga tayyormisiz?",
+            reply_markup=reply_markup,
+            parse_mode='HTML'
         )
-        await state.clear()
+    else:
+        if quiz_bot.is_admin(user.id):
+            await update.message.reply_text(
+                "❌ Noto'g'ri buyruq. Admin panelidan foydalaning.\n"
+                "Qaytadan boshlash uchun /start bosing."
+            )
+        else:
+            await update.message.reply_text(
+                f"❌ <b>Test kodi topilmadi!</b>\n\n"
+                f"Siz kiritgan kod: <code>{text}</code>\n\n"
+                f"💡 To'g'ri formatda test kodini kiriting (masalan: ABC123)",
+                parse_mode='HTML'
+            )
 
-# Main function
-async def main():
-    print("🤖 Quiz Bot with Bi-weekly Ranking and Timer starting...")
-    print(f"⏰ Question timeout: {QUESTION_TIMEOUT} seconds")
-    await dp.start_polling(bot)
+# Test creation conversation handlers
+async def create_test_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle test name input"""
+    test_name = update.message.text.strip()
+    context.user_data['test_name'] = test_name
+    
+    await update.message.reply_text(
+        f"✅ Test nomi: <b>{test_name}</b>\n\n"
+        f"❓ Nechta savol bo'ladi? (raqam kiriting):",
+        parse_mode='HTML'
+    )
+    return CREATING_TEST_QUESTIONS_COUNT
+
+async def create_test_questions_count(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle questions count input"""
+    try:
+        questions_count = int(update.message.text.strip())
+        if questions_count <= 0 or questions_count > 50:
+            await update.message.reply_text("❌ Savollar soni 1 dan 50 gacha bo'lishi kerak!")
+            return CREATING_TEST_QUESTIONS_COUNT
+        
+        context.user_data['questions_count'] = questions_count
+        context.user_data['current_question'] = 1
+        context.user_data['questions'] = []
+        
+        await update.message.reply_text(
+            f"📊 Jami savollar: <b>{questions_count}</b>\n\n"
+            f"📝 <b>1-savol matnini</b> kiriting:",
+            parse_mode='HTML'
+        )
+        return CREATING_QUESTION_TEXT
+    except ValueError:
+        await update.message.reply_text("❌ Iltimos, to'g'ri raqam kiriting!")
+        return CREATING_TEST_QUESTIONS_COUNT
+
+async def create_question_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle question text input"""
+    question_text = update.message.text.strip()
+    context.user_data['current_question_text'] = question_text
+    current_q = context.user_data['current_question']
+    
+    await update.message.reply_text(
+        f"📝 {current_q}-savol: <b>{question_text}</b>\n\n"
+        f"🅰️ <b>1-javob variantini</b> kiriting:",
+        parse_mode='HTML'
+    )
+    return CREATING_ANSWER_1
+
+async def create_answer_1(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle first answer input"""
+    answer = update.message.text.strip()
+    context.user_data['current_answers'] = [answer]
+    current_q = context.user_data['current_question']
+    
+    await update.message.reply_text(
+        f"📝 {current_q}-savol\n"
+        f"🅰️ 1: {answer}\n\n"
+        f"🅱️ <b>2-javob variantini</b> kiriting:",
+        parse_mode='HTML'
+    )
+    return CREATING_ANSWER_2
+
+async def create_answer_2(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle second answer input"""
+    answer = update.message.text.strip()
+    context.user_data['current_answers'].append(answer)
+    current_q = context.user_data['current_question']
+    answers = context.user_data['current_answers']
+    
+    await update.message.reply_text(
+        f"📝 {current_q}-savol\n"
+        f"🅰️ 1: {answers[0]}\n"
+        f"🅱️ 2: {answer}\n\n"
+        f"🅲️ <b>3-javob variantini</b> kiriting:",
+        parse_mode='HTML'
+    )
+    return CREATING_ANSWER_3
+
+async def create_answer_3(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle third answer input"""
+    answer = update.message.text.strip()
+    context.user_data['current_answers'].append(answer)
+    current_q = context.user_data['current_question']
+    answers = context.user_data['current_answers']
+    
+    keyboard = [
+        [InlineKeyboardButton("🅰️ 1-javob", callback_data="correct_0")],
+        [InlineKeyboardButton("🅱️ 2-javob", callback_data="correct_1")],
+        [InlineKeyboardButton("🅲️ 3-javob", callback_data="correct_2")]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    await update.message.reply_text(
+        f"📝 <b>{current_q}-savol:</b>\n"
+        f"🅰️ 1: {answers[0]}\n"
+        f"🅱️ 2: {answers[1]}\n"
+        f"🅲️ 3: {answers[2]}\n\n"
+        f"✅ <b>Qaysi javob to'g'ri?</b>",
+        reply_markup=reply_markup,
+        parse_mode='HTML'
+    )
+    return CREATING_CORRECT_ANSWER
+
+async def correct_answer_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle correct answer selection"""
+    query = update.callback_query
+    await query.answer()
+    
+    correct_answer = int(query.data.split("_")[1])
+    
+    # Save current question
+    question = Question(
+        text=context.user_data['current_question_text'],
+        options=context.user_data['current_answers'],
+        correct_answer=correct_answer
+    )
+    context.user_data['questions'].append(question)
+    
+    current_q = context.user_data['current_question']
+    total_q = context.user_data['questions_count']
+    
+    await query.edit_message_text(
+        f"✅ {current_q}-savol saqlandi!\n"
+        f"To'g'ri javob: {context.user_data['current_answers'][correct_answer]}"
+    )
+    
+    # Check if more questions needed
+    if current_q < total_q:
+        context.user_data['current_question'] += 1
+        next_q = context.user_data['current_question']
+        
+        await query.message.reply_text(
+            f"📝 <b>{next_q}-savol matnini</b> kiriting:",
+            parse_mode='HTML'
+        )
+        return CREATING_QUESTION_TEXT
+    else:
+        # All questions done, ask for time limit
+        await query.message.reply_text(
+            f"🎉 <b>Barcha savollar kiritildi!</b>\n\n"
+            f"⏰ Har bir savol uchun necha soniya vaqt berilsin?\n"
+            f"(10 dan 300 soniya oralig'ida):",
+            parse_mode='HTML'
+        )
+        return CREATING_TIME_LIMIT
+
+async def create_time_limit(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle time limit input"""
+    try:
+        time_limit = int(update.message.text.strip())
+        if time_limit < 10 or time_limit > 300:
+            await update.message.reply_text("❌ Vaqt 10 dan 300 soniya oralig'ida bo'lishi kerak!")
+            return CREATING_TIME_LIMIT
+        
+        # Create and save test
+        test_id = quiz_bot.generate_test_code()
+        test = Test(
+            id=test_id,
+            name=context.user_data['test_name'],
+            questions=context.user_data['questions'],
+            time_limit=time_limit,
+            created_by=update.effective_user.id,
+            created_at=datetime.now().isoformat()
+        )
+        
+        quiz_bot.tests[test_id] = test
+        quiz_bot.save_data()
+        
+        await update.message.reply_text(
+            f"🎉 <b>Test muvaffaqiyatli yaratildi!</b>\n\n"
+            f"🔑 Test kodi: <code>{test_id}</code>\n"
+            f"📝 Nom: {test.name}\n"
+            f"❓ Savollar: {len(test.questions)}\n"
+            f"⏰ Vaqt: {time_limit} soniya\n\n"
+            f"💡 Foydalanuvchilar ushbu kod orqali test topshira olishadi!",
+            parse_mode='HTML'
+        )
+        
+        # Clear context
+        context.user_data.clear()
+        return ConversationHandler.END
+        
+    except ValueError:
+        await update.message.reply_text("❌ Iltimos, to'g'ri raqam kiriting!")
+        return CREATING_TIME_LIMIT
+
+# Test taking handlers
+async def start_test_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Start test taking"""
+    query = update.callback_query
+    await query.answer()
+    
+    test_code = query.data.split("_")[-1]
+    test = quiz_bot.tests[test_code]
+    user_id = query.from_user.id
+    
+    # Initialize test session
+    quiz_bot.test_sessions[user_id] = {
+        'test_id': test_code,
+        'current_question': 0,
+        'answers': [None] * len(test.questions),
+        'start_time': datetime.now(),
+        'question_start_time': datetime.now()
+    }
+    
+    await show_question(query, user_id, 0)
+
+async def show_question(update_or_query, user_id: int, question_index: int):
+    """Show current question"""
+    session = quiz_bot.test_sessions[user_id]
+    test = quiz_bot.tests[session['test_id']]
+    question = test.questions[question_index]
+    
+    session['question_start_time'] = datetime.now()
+    
+    keyboard = []
+    for i, option in enumerate(question.options):
+        keyboard.append([InlineKeyboardButton(f"{chr(65+i)}. {option}", 
+                                            callback_data=f"answer_{i}")])
+    
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    text = (f"❓ <b>Savol {question_index + 1}/{len(test.questions)}</b>\n\n"
+            f"{question.text}\n\n"
+            f"⏰ Vaqt: {test.time_limit} soniya")
+    
+    if hasattr(update_or_query, 'edit_message_text'):
+        await update_or_query.edit_message_text(text, reply_markup=reply_markup, parse_mode='HTML')
+        message = update_or_query.message
+    else:
+        message = await update_or_query.reply_text(text, reply_markup=reply_markup, parse_mode='HTML')
+    
+    # Set timer for auto-next question
+    asyncio.create_task(question_timer(user_id, question_index, message, test.time_limit))
+
+async def question_timer(user_id: int, question_index: int, message, time_limit: int):
+    """Timer for question timeout"""
+    await asyncio.sleep(time_limit)
+    
+    if user_id not in quiz_bot.test_sessions:
+        return
+    
+    session = quiz_bot.test_sessions[user_id]
+    if session['current_question'] != question_index:
+        return  # User already answered
+    
+    # Time's up, move to next question
+    session['current_question'] += 1
+    test = quiz_bot.tests[session['test_id']]
+    
+    try:
+        if session['current_question'] < len(test.questions):
+            await message.edit_text(
+                f"⏰ <b>Vaqt tugadi!</b>\n\n"
+                f"Keyingi savolga o'tamiz...",
+                parse_mode='HTML'
+            )
+            await asyncio.sleep(1)
+            await show_question(message, user_id, session['current_question'])
+        else:
+            await finish_test(message, user_id)
+    except Exception as e:
+        logger.error(f"Error in question timer: {e}")
+
+async def answer_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle answer selection"""
+    query = update.callback_query
+    await query.answer()
+    
+    user_id = query.from_user.id
+    if user_id not in quiz_bot.test_sessions:
+        await query.edit_message_text("❌ Test sessiyasi topilmadi!")
+        return
+    
+    answer = int(query.data.split("_")[1])
+    session = quiz_bot.test_sessions[user_id]
+    test = quiz_bot.tests[session['test_id']]
+    
+    # Save answer
+    current_q = session['current_question']
+    session['answers'][current_q] = answer
+    session['current_question'] += 1
+    
+    # Show next question or finish
+    if session['current_question'] < len(test.questions):
+        await show_question(query, user_id, session['current_question'])
+    else:
+        await finish_test(query, user_id)
+
+async def finish_test(update_or_query, user_id: int):
+    """Finish test and show results"""
+    session = quiz_bot.test_sessions[user_id]
+    test = quiz_bot.tests[session['test_id']]
+    user = quiz_bot.users[user_id]
+    
+    # Calculate score
+    score = 0
+    for i, answer in enumerate(session['answers']):
+        if answer is not None and answer == test.questions[i].correct_answer:
+            score += 1
+    
+    # Calculate time taken
+    time_taken = int((datetime.now() - session['start_time']).total_seconds())
+    
+    # Create result
+    result = TestResult(
+        user_id=user_id,
+        username=f"{user.first_name} {user.last_name}".strip(),
+        test_id=test.id,
+        test_name=test.name,
+        score=score,
+        total_questions=len(test.questions),
+        answers=session['answers'],
+        completed_at=datetime.now().isoformat(),
+        time_taken=time_taken
+    )
+    
+    quiz_bot.results.append(result)
+    quiz_bot.save_data()
+    
+    # Clean up session
+    del quiz_bot.test_sessions[user_id]
+    
+    # Show result to user
+    percentage = round((score / len(test.questions)) * 100, 1)
+    result_text = (
+        f"🎉 <b>Test yakunlandi!</b>\n\n"
+        f"📝 Test: {test.name}\n"
+        f"🎯 Natija: {score}/{len(test.questions)} ({percentage}%)\n"
+        f"⏱️ Vaqt: {time_taken // 60}:{time_taken % 60:02d}\n\n"
+    )
+    
+    # Add performance message
+    if percentage >= 90:
+        result_text += "🌟 A'lo! Ajoyib natija!"
+    elif percentage >= 80:
+        result_text += "👏 Yaxshi! Zo'r natija!"
+    elif percentage >= 70:
+        result_text += "👍 O'rtacha natija."
+    elif percentage >= 50:
+        result_text += "📚 Ko'proq o'qish kerak."
+    else:
+        result_text += "💪 Keyingi safar yaxshiroq bo'ladi!"
+    
+    if hasattr(update_or_query, 'edit_message_text'):
+        await update_or_query.edit_message_text(result_text, parse_mode='HTML')
+    else:
+        await update_or_query.reply_text(result_text, parse_mode='HTML')
+    
+    # Send result to all admins
+    admin_text = (
+        f"📊 <b>Yangi test natijasi!</b>\n\n"
+        f"👤 Foydalanuvchi: {result.username}\n"
+        f"📝 Test: {test.name}\n"
+        f"🎯 Natija: {score}/{len(test.questions)} ({percentage}%)\n"
+        f"⏱️ Vaqt: {time_taken // 60}:{time_taken % 60:02d}\n"
+        f"📅 Sana: {datetime.now().strftime('%d.%m.%Y %H:%M')}"
+    )
+    
+    for admin_id in ADMIN_IDS:
+        try:
+            await context.bot.send_message(admin_id, admin_text, parse_mode='HTML')
+        except Exception as e:
+            logger.error(f"Error sending result to admin {admin_id}: {e}")
+
+async def cancel_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle cancel button"""
+    query = update.callback_query
+    await query.answer()
+    await query.edit_message_text("❌ Amal bekor qilindi.")
+    return ConversationHandler.END
+
+async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle errors"""
+    logger.error(f"Update {update} caused error {context.error}")
+
+def main():
+    """Main function to run the bot"""
+    # Create application
+    application = Application.builder().token(BOT_TOKEN).build()
+    
+    # Create conversation handler for test creation
+    test_creation_handler = ConversationHandler(
+        entry_points=[CallbackQueryHandler(button_handler, pattern="^create_test$")],
+        states={
+            CREATING_TEST_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, create_test_name)],
+            CREATING_TEST_QUESTIONS_COUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, create_test_questions_count)],
+            CREATING_QUESTION_TEXT: [MessageHandler(filters.TEXT & ~filters.COMMAND, create_question_text)],
+            CREATING_ANSWER_1: [MessageHandler(filters.TEXT & ~filters.COMMAND, create_answer_1)],
+            CREATING_ANSWER_2: [MessageHandler(filters.TEXT & ~filters.COMMAND, create_answer_2)],
+            CREATING_ANSWER_3: [MessageHandler(filters.TEXT & ~filters.COMMAND, create_answer_3)],
+            CREATING_CORRECT_ANSWER: [CallbackQueryHandler(correct_answer_handler, pattern="^correct_")],
+            CREATING_TIME_LIMIT: [MessageHandler(filters.TEXT & ~filters.COMMAND, create_time_limit)],
+        },
+        fallbacks=[CallbackQueryHandler(cancel_handler, pattern="^cancel$")],
+        per_message=False,
+        per_chat=True,
+        per_user=True,
+    )
+    
+    # Add handlers
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(test_creation_handler)
+    application.add_handler(CallbackQueryHandler(button_handler, pattern="^(users|results|weekly_ranking|my_tests)$"))
+    application.add_handler(CallbackQueryHandler(start_test_handler, pattern="^start_test_"))
+    application.add_handler(CallbackQueryHandler(answer_handler, pattern="^answer_"))
+    application.add_handler(CallbackQueryHandler(cancel_handler, pattern="^cancel$"))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message_handler))
+    application.add_error_handler(error_handler)
+    
+    # Start the bot
+    print("🤖 Quiz bot ishga tushmoqda...")
+    print(f"📊 Admin IDs: {ADMIN_IDS}")
+    print("✅ Bot tayyor!")
+    
+    application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == '__main__':
-    asyncio.run(main())
-
-
-
+    main()
