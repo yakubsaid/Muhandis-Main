@@ -2,20 +2,33 @@
 import asyncio
 import logging
 import random
+import os
+from fastapi import FastAPI, Request
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
+from aiohttp import web
 import string
 from datetime import datetime, timedelta
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 
+# Webhook settings
+WEBHOOK_HOST = 'worker-production-1da7e.up.railway.app'  # Change this to your Railway app URL
+
 # Bot configuration
 BOT_TOKEN = "8307914914:AAEWRwcfxLuYSazggBTUSD_Ry31ms-IkmVY"  # <-- Replace with your actual bot token
+
+WEBHOOK_PATH = f'/webhook/{BOT_TOKEN}'
+WEBHOOK_URL = f"{WEBHOOK_HOST}{WEBHOOK_PATH}"
+
+# Initialize FastAPI app
+app = FastAPI()
 
 # Initialize bot and dispatcher first
 bot = Bot(token=BOT_TOKEN)
@@ -761,5 +774,22 @@ async def handle_admin_callbacks(callback: CallbackQuery, state: FSMContext):
             user_list = "👥 Ro'yxatdan o'tgan foydalanuvchilar:\n\n"
             for user_id, user_info in users.items():
                 user_list += f"👤 {user_info['name']}\n"
-               
-
+                if user_info.get('username'):
+                    user_list += f"📱 @{user_info['username']}\n"
+                else:
+                    user_list += f"📱 Username yo'q\n"
+                user_list += f"🆔 ID: {user_id}\n"
+                user_list += f"📅 Oxirgi ko'rish: {user_info['last_seen']}\n\n"
+        else:
+            user_list = "👥 Hech qanday foydalanuvchi test o'tkazmagan."
+        
+        await callback.message.edit_text(
+            user_list,
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="🔙 Orqaga", callback_data="back_to_menu")]
+            ])
+        )
+    
+    elif callback.data == "my_quizzes":
+        if quizzes:
+            q
