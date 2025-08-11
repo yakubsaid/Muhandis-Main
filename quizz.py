@@ -17,15 +17,12 @@ import calendar
 logging.basicConfig(level=logging.INFO)
 
 # Bot configuration
-BOT_TOKEN = "8307914914:AAFGrH2NF97rE3fkoI44uRkNio7THrxD-Ak"  # Replace with your bot token
+BOT_TOKEN = "8307914914:AAEagGzBaPTW7saMM-U4hWcPkUb0hT8SXH8"  # Replace with your bot token
 
 # Admin configuration - Add your admin IDs here
 ADMIN_IDS = {
     5479445322,  # Main owner
-    # Add more admin IDs here, separated by commas:
-    7377694590,   # Admin 2
-    5700652572,   # Admin 3
-    6874971657,   # Admin 4
+    
 }
 
 # Helper function to check if user is admin
@@ -1158,3 +1155,4 @@ async def main():
 
 if __name__ == '__main__':
     asyncio.run(main())
+
