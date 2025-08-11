@@ -4,6 +4,7 @@ import logging
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
+from aiogram.enums import ChatMemberStatus
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
@@ -17,17 +18,24 @@ import calendar
 logging.basicConfig(level=logging.INFO)
 
 # Bot configuration
-BOT_TOKEN = "8307914914:AAEagGzBaPTW7saMM-U4hWcPkUb0hT8SXH8"  # Replace with your bot token
+BOT_TOKEN = "8307914914:AAEQ5sK4piiwo1KDu6wNFbi03Q5KaBRUVQI"  # Replace with your bot token
 
-# Admin configuration - Add your admin IDs here
-ADMIN_IDS = {
-    5479445322,  # Main owner
-    
-}
+# Channel and admin configuration
+REQUIRED_CHANNEL = "@Muhandis_e"  # Majburiy kanal username
+ADMIN_IDS = 7377694590  # Yagona admin ID
 
 # Helper function to check if user is admin
 def is_admin(user_id):
-    return user_id in ADMIN_IDS
+    return user_id == ADMIN_IDS
+
+# Helper function to check channel membership
+async def check_channel_membership(user_id):
+    try:
+        member = await bot.get_chat_member(chat_id=REQUIRED_CHANNEL, user_id=user_id)
+        return member.status in [ChatMemberStatus.MEMBER, ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.CREATOR]
+    except Exception as e:
+        logging.error(f"Error checking membership for user {user_id}: {e}")
+        return False
 
 # Initialize bot and dispatcher
 bot = Bot(token=BOT_TOKEN)
@@ -339,7 +347,7 @@ class QuizTimer:
             
             await bot.send_message(user_id, result_text)
             
-            # Send results to owner
+            # Send results to admin
             current_ranking = BiWeeklyManager.get_current_bi_weekly_ranking()
             user_position = None
             for i, user in enumerate(current_ranking, 1):
@@ -347,28 +355,27 @@ class QuizTimer:
                     user_position = i
                     break
             
-            owner_text = f"📊 Yangi Test Natijasi!\n\n"
-            owner_text += f"🎯 Test: {quiz['name']}\n"
-            owner_text += f"👤 Talaba: {user_name}\n"
+            admin_text = f"📊 Yangi Test Natijasi!\n\n"
+            admin_text += f"🎯 Test: {quiz['name']}\n"
+            admin_text += f"👤 Talaba: {user_name}\n"
             if username:
-                owner_text += f"📱 Username: @{username}\n"
+                admin_text += f"📱 Username: @{username}\n"
             else:
-                owner_text += f"📱 Username yo'q\n"
-            owner_text += f"🆔 ID: {user_id}\n"
-            owner_text += f"📊 Ball: {score}/{total_questions} ({percentage}%)\n"
-            owner_text += f"✅ Javob berildi: {answered_count}\n"
-            owner_text += f"⏰ Vaqt tugadi: {timeout_count}\n"
-            owner_text += f"📅 Sana: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+                admin_text += f"📱 Username yo'q\n"
+            admin_text += f"🆔 ID: {user_id}\n"
+            admin_text += f"📊 Ball: {score}/{total_questions} ({percentage}%)\n"
+            admin_text += f"✅ Javob berildi: {answered_count}\n"
+            admin_text += f"⏰ Vaqt tugadi: {timeout_count}\n"
+            admin_text += f"📅 Sana: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
             
             if user_position:
-                owner_text += f"\n🏆 Ikki haftalik reytingda: {user_position}-o'rin"
+                admin_text += f"\n🏆 Ikki haftalik reytingda: {user_position}-o'rin"
             
-            # Send to all admins
-            for admin_id in ADMIN_IDS:
-                try:
-                    await bot.send_message(admin_id, owner_text)
-                except Exception as e:
-                    logging.error(f"Failed to send message to admin {admin_id}: {e}")
+            # Send to admin
+            try:
+                await bot.send_message(ADMIN_ID, admin_text)
+            except Exception as e:
+                logging.error(f"Failed to send message to admin {ADMIN_ID}: {e}")
             
             # Clean up
             await QuizTimer.cancel_timer(user_id)
@@ -432,8 +439,8 @@ class QuizManager:
         quiz_name = quizzes[quiz_code]['name']
         BiWeeklyManager.update_bi_weekly_ranking(user_id, user_name, username, score, total, quiz_name)
 
-# Owner keyboard
-def get_owner_keyboard():
+# Admin keyboard
+def get_admin_keyboard():
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="📝 Test yaratish", callback_data="create_quiz")],
         [InlineKeyboardButton(text="📊 Testlar natijalari", callback_data="view_results")],
@@ -468,27 +475,71 @@ def get_ranking_keyboard():
     ])
     return keyboard
 
+# Channel membership keyboard
+def get_channel_keyboard():
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📢 Kanalga qo'shilish", url=f"https://t.me/{REQUIRED_CHANNEL[1:]}")],
+        [InlineKeyboardButton(text="✅ A'zolikni tekshirish", callback_data="check_membership")]
+    ])
+    return keyboard
+
 # Start command
 @dp.message(Command("start"))
 async def start_command(message: types.Message, state: FSMContext):
-    # Clear any existing state
+    # Clear any existing state and timer
     await state.clear()
+    await QuizTimer.cancel_timer(message.from_user.id)
     
     if is_admin(message.from_user.id):
         await message.answer(
-            "🎮 Test Botga Xush kelibsiz!\n\n"
-            "Siz adminsiz. Qanday ish qilmoqchisiz:",
-            reply_markup=get_owner_keyboard()
+            "🎮 Admin panelga xush kelibsiz!\n\n"
+            "Qanday ish qilmoqchisiz:",
+            reply_markup=get_admin_keyboard()
         )
     else:
+        # Check channel membership for regular users
+        is_member = await check_channel_membership(message.from_user.id)
+        if not is_member:
+            await message.answer(
+                "❌ Botdan foydalanish uchun avval kanalga qo'shiling!\n\n"
+                f"📢 Kanal: {REQUIRED_CHANNEL}\n\n"
+                "Qo'shilgandan keyin 'A'zolikni tekshirish' tugmasini bosing.",
+                reply_markup=get_channel_keyboard()
+            )
+            return
+        
         await message.answer(
             "🎮 Test Botga Xush kelibsiz!\n\n"
             "Test olish uchun quyidagi buyruqdan foydalaning:\n"
             "/quiz [CODE]\n\n"
             "Misol: /quiz ABC123\n\n"
             f"⏰ Har bir savol uchun {QUESTION_TIMEOUT} soniya vaqt beriladi!\n\n"
+            "📊 Joriy reytingni ko'rish: /ranking\n\n"
             "Test yaratuvchisidan test kodini oling!"
         )
+
+# Check membership callback
+@dp.callback_query(lambda c: c.data == "check_membership")
+async def check_membership_callback(callback: CallbackQuery):
+    if is_admin(callback.from_user.id):
+        await callback.answer("Siz adminsiz!", show_alert=True)
+        return
+    
+    is_member = await check_channel_membership(callback.from_user.id)
+    if is_member:
+        await callback.message.edit_text(
+            "✅ A'zolik tasdiqlandi! Endi test botdan foydalanishingiz mumkin.\n\n"
+            "Test olish uchun quyidagi buyruqdan foydalaning:\n"
+            "/quiz [CODE]\n\n"
+            "Misol: /quiz ABC123\n\n"
+            f"⏰ Har bir savol uchun {QUESTION_TIMEOUT} soniya vaqt beriladi!\n\n"
+            "📊 Joriy reytingni ko'rish: /ranking"
+        )
+    else:
+        await callback.answer("❌ Hali ham kanalga qo'shilmagansiz!", show_alert=True)
+    
+    await callback.answer()
+
 
 # Quiz command for users
 @dp.message(Command("quiz"))
@@ -1155,4 +1206,3 @@ async def main():
 
 if __name__ == '__main__':
     asyncio.run(main())
-
