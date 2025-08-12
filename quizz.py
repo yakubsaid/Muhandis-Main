@@ -1,6 +1,9 @@
 # main.py
+import os
+import sys
 import asyncio
 import logging
+from dotenv import load_dotenv
 import random
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
@@ -10,17 +13,37 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 import string
 from datetime import datetime, timedelta
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
+from aiohttp import web
+
+# Load environment variables
+load_dotenv()
 
 # Configure logging
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    stream=sys.stdout
+)
+logger = logging.getLogger(__name__)
 
 # Bot configuration
-BOT_TOKEN = "8307914914:AAE2D1hRJacnjxtmYjL2gP0pXmJpfkkkxmo"  # <-- Replace with your actual bot token
+BOT_TOKEN = os.getenv("8307914914:AAE2D1hRJacnjxtmYjL2gP0pXmJpfkkkxmo")
+if not BOT_TOKEN:
+    logger.error("No token provided. Set BOT_TOKEN environment variable!")
+    sys.exit(1)
 
-# Initialize bot and dispatcher
-bot = Bot(token=BOT_TOKEN)
-storage = MemoryStorage()
-dp = Dispatcher(storage=storage)
+# Initialize bot and dispatcher with error handling
+try:
+    bot = Bot(token=BOT_TOKEN)
+    storage = MemoryStorage()
+    dp = Dispatcher(storage=storage)
+    logger.info("Bot initialized successfully")
+except Exception as e:
+    logger.error(f"Failed to initialize bot: {e}")
+    sys.exit(1)
 
 # Channel configuration
 CHANNEL_USERNAME = "@saidjamolyakubov"  # Replace with your channel username
@@ -765,6 +788,551 @@ async def handle_admin_callbacks(callback: CallbackQuery, state: FSMContext):
                     user_list += f"📱 @{user_info['username']}\n"
                 else:
                     user_list += f"📱 Username yo'q\n"
-             
+                user_list += f"🆔 ID: {user_id}\n"
+                user_list += f"📅 Oxirgi ko'rish: {user_info['last_seen']}\n\n"
+        else:
+            user_list = "👥 Hech qanday foydalanuvchi test o'tkazmagan."
+        
+        await callback.message.edit_text(
+            user_list,
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="🔙 Orqaga", callback_data="back_to_menu")]
+            ])
+        )
+    
+    elif callback.data == "my_quizzes":
+        if quizzes:
+            quiz_list = "🗂️ Testlaringiz:\n\n"
+            for code, quiz in quizzes.items():
+                quiz_list += f"🎯 {quiz['name']}\n"
+                quiz_list += f"🔑 Kod: {code}\n"
+                quiz_list += f"❓ Savollar: {len(quiz['questions'])}\n\n"
+        else:
+            quiz_list = "🗂️ Hech qanday test yaratilmagan."
+        
+        await callback.message.edit_text(
+            quiz_list,
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="🔙 Orqaga", callback_data="back_to_menu")]
+            ])
+        )
+    
+    elif callback.data == "back_to_menu":
+        await callback.message.edit_text(
+            "🎮 Test Botga xush kelibsiz!\n\n"
+            "Siz adminsiz. Qanday ish qilmoqchisiz:",
+            reply_markup=get_owner_keyboard()
+        )
+    
+    elif callback.data.startswith("quiz_results_"):
+        quiz_code = callback.data.replace("quiz_results_", "")
+        results = quiz_results.get(quiz_code, [])
+        quiz = quizzes.get(quiz_code)
+        
+        if results:
+            results_text = f"📊 Natijalar: {quiz['name']}\n\n"
+            for i, result in enumerate(results, 1):
+                # Calculate timeout statistics
+                timeout_count = sum(1 for answer in result['answers'] if answer.get('timeout', False))
+                answered_count = result['total'] - timeout_count
+                
+                results_text += f"{i}. {result['user_name']}\n"
+                if result.get('username'):
+                    results_text += f"   @{result['username']}\n"
+                else:
+                    results_text += f"   Username yo'q\n"
+                results_text += f"   ID: {result['user_id']}\n"
+                results_text += f"   Ball: {result['score']}/{result['total']}\n"
+                results_text += f"   ✅ Javob berildi: {answered_count}\n"
+                results_text += f"   ⏰ Vaqt tugadi: {timeout_count}\n"
+                results_text += f"   Sana: {result['date']}\n\n"
+        else:
+            results_text = f"📊 Natijalar: {quiz['name']}\n\n"
+            results_text += "Hali hech kim test topshirmagan."
+        
+        await callback.message.edit_text(
+            results_text,
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="🔙 Orqaga", callback_data="view_results")]
+            ])
+        )
+    
+    await callback.answer()
 
+# Handle ADMIN quiz creation messages (separated from regular users)
+@dp.message(lambda m: is_admin(m.from_user.id), QuizCreation.waiting_for_quiz_name)
+async def process_quiz_name(message: types.Message, state: FSMContext):
+    await state.update_data(quiz_name=message.text)
+    await message.answer(
+        f"✅ Test nomi: {message.text}\n\n"
+        "Qancha savol qo'shmoqchisiz? (Raqam kiriting):"
+    )
+    await state.set_state(QuizCreation.waiting_for_question_count)
 
+@dp.message(lambda m: is_admin(m.from_user.id), QuizCreation.waiting_for_question_count)
+async def process_question_count(message: types.Message, state: FSMContext):
+    try:
+        count = int(message.text)
+        if count <= 0:
+            await message.answer("❌ Iltimos, musbat raqam kiriting.")
+            return
+        if count > 50:
+            await message.answer("❌ Maksimal 50 ta savol qo'shish mumkin.")
+            return
+    except ValueError:
+        await message.answer("❌ Iltimos, to'g'ri raqam kiriting.")
+        return
+    
+    await state.update_data(
+        question_count=count,
+        current_question=1,
+        questions=[]
+    )
+    await message.answer(
+        f"📝 1-savol {count} dan:\n\n"
+        "Iltimos, savolni kiriting:"
+    )
+    await state.set_state(QuizCreation.waiting_for_question)
+
+@dp.message(lambda m: is_admin(m.from_user.id), QuizCreation.waiting_for_question)
+async def process_question(message: types.Message, state: FSMContext):
+    await state.update_data(current_question_text=message.text)
+    await message.answer(
+        f"Savol: {message.text}\n\n"
+        "Endi 3 ta javob variantini kiriting, har birini alohida xabarda.\n"
+        "Variant 1 ni yuboring:"
+    )
+    await state.update_data(variants=[], variant_count=1)
+    await state.set_state(QuizCreation.waiting_for_variants)
+
+@dp.message(lambda m: is_admin(m.from_user.id), QuizCreation.waiting_for_variants)
+async def process_variants(message: types.Message, state: FSMContext):
+    data = await state.get_data()
+    variants = data.get('variants', [])
+    variants.append(message.text)
+    variant_count = data.get('variant_count', 1)
+    
+    if variant_count < 3:
+        await state.update_data(variants=variants, variant_count=variant_count + 1)
+        await message.answer(f"✅ Variant {variant_count}: {message.text}\n\nVariant {variant_count + 1} ni yuboring:")
+    else:
+        await state.update_data(variants=variants)
+        variant_text = "\n".join([f"{chr(65+i)}) {v}" for i, v in enumerate(variants)])
+        await message.answer(
+            f"✅ Hamma variantlar qo'shildi:\n\n{variant_text}\n\n"
+            "Qaysi javob to'g'ri? (A, B, yoki C ni kiriting):"
+        )
+        await state.set_state(QuizCreation.waiting_for_correct_answer)
+
+@dp.message(lambda m: is_admin(m.from_user.id), QuizCreation.waiting_for_correct_answer)
+async def process_correct_answer(message: types.Message, state: FSMContext):
+    answer_text = message.text.upper().strip()
+    
+    if answer_text not in ['A', 'B', 'C', '1', '2', '3']:
+        await message.answer("❌ Iltimos, A, B, C yoki 1, 2, 3 ni kiriting.")
+        return
+    
+    # Convert to 0-based index
+    if answer_text in ['A', '1']:
+        correct_answer = 0
+    elif answer_text in ['B', '2']:
+        correct_answer = 1
+    else:  # C or 3
+        correct_answer = 2
+    
+    data = await state.get_data()
+    questions = data.get('questions', [])
+    
+    question_data = {
+        'question': data['current_question_text'],
+        'variants': data['variants'],
+        'correct_answer': correct_answer
+    }
+    questions.append(question_data)
+    
+    current_question = data['current_question']
+    question_count = data['question_count']
+    
+    if current_question < question_count:
+        await state.update_data(
+            questions=questions,
+            current_question=current_question + 1
+        )
+        await message.answer(
+            f"✅ Savol {current_question} saqlandi!\n\n"
+            f"📝 {current_question + 1}-savol {question_count} dan:\n\n"
+            "Iltimos, savolni kiriting:"
+        )
+        await state.set_state(QuizCreation.waiting_for_question)
+    else:
+        # Quiz creation complete
+        quiz_data = {
+            'name': data['quiz_name'],
+            'questions': questions,
+            'created_date': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+            'created_by': message.from_user.id
+        }
+        
+        quiz_code = QuizManager.save_quiz(quiz_data)
+        
+        await message.answer(
+            f"🎉 Test muvaffaqiyatli yaratildi!\n\n"
+            f"📝 Test: {quiz_data['name']}\n"
+            f"🔑 Kod: {quiz_code}\n"
+            f"❓ Savollar: {len(questions)}\n"
+            f"⏰ Har savol uchun: {QUESTION_TIMEOUT} soniya\n\n"
+            f"Ushbu kodni foydalanuvchilar bilan ulashing:\n"
+            f"`/quiz {quiz_code}`\n\n"
+            "Yana test yaratmoqchimisiz?",
+            reply_markup=get_owner_keyboard()
+        )
+        await state.clear()
+
+# Handle USER quiz taking messages (non-admin only)
+@dp.message(lambda m: not is_admin(m.from_user.id), QuizTaking.waiting_for_name)
+async def process_user_name(message: types.Message, state: FSMContext):
+    name = message.text.strip()
+    if len(name) < 2:
+        await message.answer("❌ Iltimos, to'liq ismingizni kiriting (kamida 2 ta belgi).")
+        return
+    
+    data = await state.get_data()
+    await state.update_data(
+        user_name=name,
+        current_question=0,
+        answers=[],
+        score=0
+    )
+    
+    quiz = data['quiz']
+    question = quiz['questions'][0]
+    
+    # Create answer buttons
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=f"A) {question['variants'][0]}", callback_data="answer_0")],
+        [InlineKeyboardButton(text=f"B) {question['variants'][1]}", callback_data="answer_1")],
+        [InlineKeyboardButton(text=f"C) {question['variants'][2]}", callback_data="answer_2")]
+    ])
+    
+    sent_message = await message.answer(
+        f"👋 Salom, {name}!\n\n"
+        f"🎯 Test: {quiz['name']}\n\n"
+        f"📝 1-savol {len(quiz['questions'])} dan:\n"
+        f"⏳ {QUESTION_TIMEOUT} soniya\n\n"
+        f"{question['question']}",
+        reply_markup=keyboard
+    )
+    
+    # Store message ID for editing later
+    await state.update_data(current_message_id=sent_message.message_id)
+    await state.set_state(QuizTaking.taking_quiz)
+    
+    # Start timer for first question
+    await QuizTimer.start_question_timer(message.from_user.id, state)
+
+# Handle quiz answers (only for non-admin users)
+@dp.callback_query(lambda c: c.data.startswith("answer_") and not is_admin(c.from_user.id))
+async def handle_quiz_answers(callback: CallbackQuery, state: FSMContext):
+    # Cancel the timer since user answered
+    await QuizTimer.cancel_timer(callback.from_user.id)
+    
+    data = await state.get_data()
+    quiz = data['quiz']
+    current_question = data['current_question']
+    answers = data.get('answers', [])
+    score = data.get('score', 0)
+    
+    # Get selected answer
+    selected_answer = int(callback.data.split('_')[1])
+    correct_answer = quiz['questions'][current_question]['correct_answer']
+    
+    # Check if answer is correct
+    is_correct = selected_answer == correct_answer
+    if is_correct:
+        score += 1
+    
+    answers.append({
+        'question': quiz['questions'][current_question]['question'],
+        'selected': selected_answer,
+        'correct': correct_answer,
+        'is_correct': is_correct,
+        'timeout': False
+    })
+    
+    current_question += 1
+    
+    if current_question < len(quiz['questions']):
+        # Next question
+        question = quiz['questions'][current_question]
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text=f"A) {question['variants'][0]}", callback_data="answer_0")],
+            [InlineKeyboardButton(text=f"B) {question['variants'][1]}", callback_data="answer_1")],
+            [InlineKeyboardButton(text=f"C) {question['variants'][2]}", callback_data="answer_2")]
+        ])
+        
+        await callback.message.edit_text(
+            f"📝 {current_question + 1}-savol {len(quiz['questions'])} dan:\n"
+            f"⏳ {QUESTION_TIMEOUT} soniya\n\n"
+            f"{question['question']}",
+            reply_markup=keyboard
+        )
+        
+        await state.update_data(
+            current_question=current_question,
+            answers=answers,
+            score=score
+        )
+        
+        # Start timer for next question
+        await QuizTimer.start_question_timer(callback.from_user.id, state)
+    else:
+        # Quiz finished
+        quiz_code = data['quiz_code']
+        user_name = data['user_name']
+        total_questions = len(quiz['questions'])
+        
+        # Save result
+        QuizManager.save_result(
+            quiz_code, user_name, callback.from_user.id, 
+            callback.from_user.username,
+            score, total_questions, answers
+        )
+        
+        # Calculate statistics
+        answered_count = sum(1 for answer in answers if not answer.get('timeout', False))
+        timeout_count = total_questions - answered_count
+        percentage = round((score/total_questions) * 100, 1)
+        
+        # Show results to user
+        result_text = f"🎉 Test tugatildi!\n\n"
+        result_text += f"👤 Ism: {user_name}\n"
+        result_text += f"📊 Ball: {score}/{total_questions}\n"
+        result_text += f"📈 Foiz: {percentage}%\n"
+        result_text += f"✅ Javob berildi: {answered_count}\n"
+        result_text += f"⏰ Vaqt tugadi: {timeout_count}\n\n"
+        
+        if score == total_questions:
+            result_text += "🏆 Mukammal ball! Tabriklaymiz!"
+        elif score >= total_questions * 0.8:
+            result_text += "🎯 Ajoyib ish! Zo'r natija!"
+        elif score >= total_questions * 0.6:
+            result_text += "👍 Yaxshi ish! Davom eting!"
+        else:
+            result_text += "📚 O'qishni davom ettiring va qayta urinib ko'ring!"
+        
+        result_text += f"\n\n🏆 Ikki haftalik reytingga qo'shildi!"
+        
+        await callback.message.edit_text(result_text)
+        
+        # Send results to owner with bi-weekly ranking info
+        current_ranking = BiWeeklyManager.get_current_bi_weekly_ranking()
+        user_position = None
+        for i, user in enumerate(current_ranking, 1):
+            if user['user_id'] == callback.from_user.id:
+                user_position = i
+                break
+        
+        owner_text = f"📊 Yangi Test Natijasi!\n\n"
+        owner_text += f"🎯 Test: {quiz['name']}\n"
+        owner_text += f"👤 Talaba: {user_name}\n"
+        if callback.from_user.username:
+            owner_text += f"📱 Username: @{callback.from_user.username}\n"
+        else:
+            owner_text += f"📱 Username yo'q\n"
+        owner_text += f"🆔 ID: {callback.from_user.id}\n"
+        owner_text += f"📊 Ball: {score}/{total_questions} ({percentage}%)\n"
+        owner_text += f"✅ Javob berildi: {answered_count}\n"
+        owner_text += f"⏰ Vaqt tugadi: {timeout_count}\n"
+        owner_text += f"📅 Sana: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+        
+        if user_position:
+            owner_text += f"\n🏆 Ikki haftalik reytingda: {user_position}-o'rin"
+        
+        # Send to admin
+        try:
+            await bot.send_message(ADMIN_ID, owner_text)
+        except Exception as e:
+            logging.error(f"Failed to send message to admin: {e}")
+        
+        await state.clear()
+    
+    await callback.answer()
+
+# Ranking command for all users
+@dp.message(Command("ranking"))
+async def ranking_command(message: types.Message):
+    if is_admin(message.from_user.id):
+        pass  # Admin can see ranking without subscription
+    else:
+        # Check channel subscription for non-admin users
+        if not await check_subscription(message.from_user.id):
+            subscribe_button = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="👉 Kanalga a'zo bo'lish", url=REQUIRED_CHANNEL)],
+                [InlineKeyboardButton(text="✅ Tekshirish", callback_data="check_subscription")]
+            ])
+            await message.answer(
+                f"❗️ Botdan foydalanish uchun kanalimizga a'zo bo'ling:\n"
+                f"👉 {CHANNEL_USERNAME}\n\n"
+                f"A'zo bo'lgandan so'ng \"✅ Tekshirish\" tugmasini bosing.",
+                reply_markup=subscribe_button
+            )
+            return
+    
+    current_ranking = BiWeeklyManager.get_current_bi_weekly_ranking()
+    current_bi_week = BiWeeklyManager.get_current_bi_week()
+    
+    if current_ranking:
+        start_date, end_date = BiWeeklyManager.get_bi_week_dates(current_bi_week)
+        ranking_text = f"🏆 Joriy ikki hafta reytingi\n"
+        ranking_text += f"📅 {start_date.strftime('%d.%m.%Y')} - {end_date.strftime('%d.%m.%Y')}\n\n"
+        
+        # Show different amount based on user type
+        show_count = 20 if is_admin(message.from_user.id) else 10
+        
+        for i, user in enumerate(current_ranking[:show_count], 1):
+            medal = "🥇" if i == 1 else "🥈" if i == 2 else "🥉" if i == 3 else f"{i}."
+            ranking_text += f"{medal} {user['name']}\n"
+            ranking_text += f"   📊 {user['average_percentage']}% ({user['total_score']}/{user['total_questions']})\n"
+            ranking_text += f"   🎯 {user['quiz_count']} ta test\n"
+            
+            # Highlight current user
+            if user['user_id'] == message.from_user.id:
+                ranking_text += "   ⭐ SIZ\n"
+            ranking_text += "\n"
+        
+        # If user is not in top 10, show their position
+        if not is_admin(message.from_user.id):
+            user_position = None
+            user_data = None
+            for i, user in enumerate(current_ranking, 1):
+                if user['user_id'] == message.from_user.id:
+                    user_position = i
+                    user_data = user
+                    break
+            
+            if user_position and user_position > 10:
+                ranking_text += f"...\n\n"
+                ranking_text += f"{user_position}. {user_data['name']} ⭐ SIZ\n"
+                ranking_text += f"   📊 {user_data['average_percentage']}% ({user_data['total_score']}/{user_data['total_questions']})\n"
+                ranking_text += f"   🎯 {user_data['quiz_count']} ta test\n"
+    else:
+        ranking_text = f"🏆 Joriy ikki hafta reytingi\n\n"
+        ranking_text += "Hali hech kim test topshirmagan."
+    
+    await message.answer(ranking_text)
+
+# Handle unexpected messages during quiz creation (for admins)
+@dp.message(lambda m: is_admin(m.from_user.id))
+async def handle_admin_messages(message: types.Message, state: FSMContext):
+    current_state = await state.get_state()
+    
+    # If admin is not in any specific state, show menu
+    if current_state is None:
+        await message.answer(
+            "🎮 Admin Panel\n\n"
+            "Qanday ish qilmoqchisiz:",
+            reply_markup=get_owner_keyboard()
+        )
+    else:
+        # If admin is in a state but sent unexpected message, provide guidance
+        if current_state == QuizCreation.waiting_for_quiz_name.state:
+            await message.answer("❌ Iltimos, test nomini kiriting yoki /start bosing va qaytadan boshlang.")
+        elif current_state == QuizCreation.waiting_for_question_count.state:
+            await message.answer("❌ Iltimos, faqat raqam kiriting yoki /start bosing va qaytadan boshlang.")
+        elif current_state == QuizCreation.waiting_for_question.state:
+            await message.answer("❌ Iltimos, savol matnini kiriting yoki /start bosing va qaytadan boshlang.")
+        elif current_state == QuizCreation.waiting_for_variants.state:
+            await message.answer("❌ Iltimos, javob variantini kiriting yoki /start bosing va qaytadan boshlang.")
+        elif current_state == QuizCreation.waiting_for_correct_answer.state:
+            await message.answer("❌ Iltimos, to'g'ri javobni kiriting (A, B, C) yoki /start bosing va qaytadan boshlang.")
+
+# Handle unexpected messages for regular users during quiz taking
+@dp.message(lambda m: not is_admin(m.from_user.id))
+async def handle_user_messages(message: types.Message, state: FSMContext):
+    current_state = await state.get_state()
+    
+    # If user is taking quiz and sends a message, cancel timer
+    if current_state == QuizTaking.taking_quiz.state:
+        await QuizTimer.cancel_timer(message.from_user.id)
+        await message.answer(
+            "❌ Test bekor qilindi!\n\n"
+            "Qaytadan test olish uchun /quiz [CODE] buyrug'idan foydalaning."
+        )
+        await state.clear()
+    elif current_state == QuizTaking.waiting_for_name.state:
+        # This should be handled by the specific handler above
+        pass
+    else:
+        # User is not in any quiz state
+        await message.answer(
+            "🎮 Test Botga xush kelibsiz!\n\n"
+            "Test olish uchun quyidagi buyruqdan foydalaning:\n"
+            "/quiz [CODE]\n\n"
+            "Misol: /quiz ABC123\n\n"
+            f"⏰ Har bir savol uchun {QUESTION_TIMEOUT} soniya vaqt beriladi!\n\n"
+            "Test yaratuvchisidan test kodini oling!"
+        )
+
+# Add webhook settings after bot initialization
+WEBHOOK_HOST = 'https://web-production-17bbe.up.railway.app'
+WEBHOOK_PATH = f'/webhook/{BOT_TOKEN}'
+WEBHOOK_URL = f"{WEBHOOK_HOST}{WEBHOOK_PATH}"
+
+# Initialize FastAPI app
+app = FastAPI()
+
+# Add CORS middleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Replace the main() function with this
+async def on_startup():
+    """Set webhook on startup"""
+    logger.info("Setting webhook...")
+    await bot.set_webhook(url=WEBHOOK_URL)
+    logger.info(f"Webhook set to {WEBHOOK_URL}")
+
+async def on_shutdown():
+    """Remove webhook on shutdown"""
+    logger.info("Removing webhook...")
+    await bot.delete_webhook()
+    await bot.session.close()
+    logger.info("Webhook removed")
+
+# Webhook endpoint
+@app.post(WEBHOOK_PATH)
+async def bot_webhook(request: web.Request):
+    """Process webhook updates"""
+    try:
+        await dp.feed_webhook_update(bot, request)
+        return web.Response()
+    except Exception as e:
+        logger.error(f"Webhook error: {e}")
+        return web.Response(status=500)
+
+# Setup routes and handlers
+@app.on_event("startup")
+async def start_bot():
+    await on_startup()
+
+@app.on_event("shutdown")
+async def stop_bot():
+    await on_shutdown()
+
+# Remove if __name__ == '__main__' block and replace with:
+if __name__ == "__main__":
+    import uvicorn
+    
+    PORT = int(os.getenv("PORT", 8000))
+    
+    # Run FastAPI app
+    uvicorn.run(
+        app,
+        host="0.0.0.0",
+        port=PORT
+    )
